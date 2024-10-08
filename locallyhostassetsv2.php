@@ -3,7 +3,7 @@
 Plugin Name: Self-Host Third-Party CSS, Fonts, and JavaScript
 Description: Downloads and self-hosts third-party CSS, fonts, and JavaScript files with settings for enabling/disabling functionality, cache control, and cleanup.
 Version: 1.5
-Author: Your Name
+Author: Jazir5
 Text Domain: self-host-assets
 */
 
