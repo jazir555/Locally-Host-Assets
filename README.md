@@ -1,6 +1,6 @@
 # Locally Host Assets
 
-Wordpress Plugin to Locally Host Third-Party CSS and Font Files To Eliminate Third Party HTTP Requests
+Wordpress Plugin to Locally Host Third-Party CSS, JS and Font Files To Eliminate Third Party HTTP Requests
 
 **Purpose and Benefits**
 
