@@ -1,4 +1,4 @@
-# Locally-Host-CSS-and-Fonts
+# Locally Host Assets
 
 Wordpress Plugin to Locally Host Third-Party CSS and Font Files To Eliminate Third Party HTTP Requests
 
