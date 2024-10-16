@@ -15,9 +15,9 @@ if (!defined('ABSPATH')) {
 class SelfHostAssets {
 
     // Default cache expiration times in days
-    const DEFAULT_CACHE_EXPIRATION_CSS = 7;
+    const DEFAULT_CACHE_EXPIRATION_CSS   = 7;
     const DEFAULT_CACHE_EXPIRATION_FONTS = 30;
-    const DEFAULT_CACHE_EXPIRATION_JS = 7;
+    const DEFAULT_CACHE_EXPIRATION_JS    = 7;
 
     // Maximum depth for nested @import statements
     const MAX_IMPORT_DEPTH = 5;
@@ -77,14 +77,6 @@ class SelfHostAssets {
     }
 
     public function activate() {
-        // Ensure the WordPress Filesystem API is initialized
-        if (!$this->initialize_filesystem()) {
-            return;
-        }
-
-        // Process all resources upon activation
-        $this->process_all_resources(true);
-
         // Schedule the cron event if not already scheduled
         $custom_schedule = get_option('cron_schedule', 'daily');
         if (!wp_next_scheduled('self_host_assets_cron_event')) {
@@ -115,7 +107,7 @@ class SelfHostAssets {
 
     public function self_host_resources() {
         $self_host_css_enabled = get_option('self_host_css', 1);
-        $self_host_js_enabled = get_option('self_host_js', 0);
+        $self_host_js_enabled  = get_option('self_host_js', 0);
 
         // Enqueue cached CSS and Fonts
         if ($self_host_css_enabled) {
@@ -130,7 +122,7 @@ class SelfHostAssets {
 
     private function process_all_resources($force_refresh = false) {
         $self_host_css_enabled = get_option('self_host_css', 1);
-        $self_host_js_enabled = get_option('self_host_js', 0);
+        $self_host_js_enabled  = get_option('self_host_js', 0);
 
         if ($self_host_css_enabled) {
             $this->process_all_styles($force_refresh);
@@ -162,10 +154,7 @@ class SelfHostAssets {
             $src = $style->src;
 
             // Only process external URLs
-            $src_host = wp_parse_url($src, PHP_URL_HOST);
-            $home_host = wp_parse_url(home_url(), PHP_URL_HOST);
-
-            if ($src_host === $home_host || empty($src_host)) {
+            if (!$this->is_external_url($src)) {
                 continue; // Skip local styles
             }
 
@@ -207,10 +196,7 @@ class SelfHostAssets {
             $src = $script->src;
 
             // Only process external URLs
-            $src_host = wp_parse_url($src, PHP_URL_HOST);
-            $home_host = wp_parse_url(home_url(), PHP_URL_HOST);
-
-            if ($src_host === $home_host || empty($src_host)) {
+            if (!$this->is_external_url($src)) {
                 continue; // Skip local scripts
             }
 
@@ -233,7 +219,7 @@ class SelfHostAssets {
 
     private function download_and_replace_css($url, $force_refresh = false) {
         $cache_expiration_days = intval(get_option('cache_expiration_days_css', self::DEFAULT_CACHE_EXPIRATION_CSS));
-        $file_url = $this->download_file($url, 'css', $cache_expiration_days, $force_refresh);
+        $file_url              = $this->download_file($url, 'css', $cache_expiration_days, $force_refresh);
 
         if ($file_url) {
             $file_path = $this->get_local_file_path($url, 'css');
@@ -242,11 +228,15 @@ class SelfHostAssets {
                 $file_content = file_get_contents($file_path);
 
                 if ($file_content !== false) {
-                    $processed_urls = [];
+                    $processed_urls  = [];
                     $updated_content = $this->process_css_content($file_content, $url, $processed_urls, $force_refresh, 0);
 
                     if (is_writable($file_path)) {
-                        file_put_contents($file_path, $updated_content);
+                        $result = file_put_contents($file_path, $updated_content);
+                        if ($result === false) {
+                            $this->log_error(sprintf(__('Failed to write updated CSS content to file: %s', 'self-host-assets'), esc_html($file_path)));
+                            return false;
+                        }
                     } else {
                         $this->log_error(sprintf(__('CSS file is not writable: %s', 'self-host-assets'), esc_html($file_path)));
                         return false;
@@ -280,12 +270,12 @@ class SelfHostAssets {
         }
 
         $upload_dir = wp_upload_dir();
-        $sub_dir = 'self-hosted-' . $type . '/';
-        $dir = trailingslashit($upload_dir['basedir']) . $sub_dir;
-        $url_dir = trailingslashit($upload_dir['baseurl']) . $sub_dir;
-        $filename = md5($url) . '.' . $type;
-        $file_path = $dir . $filename;
-        $file_url = $url_dir . $filename;
+        $sub_dir    = 'self-hosted-' . $type . '/';
+        $dir        = trailingslashit($upload_dir['basedir']) . $sub_dir;
+        $url_dir    = trailingslashit($upload_dir['baseurl']) . $sub_dir;
+        $filename   = md5($url) . '.' . $type;
+        $file_path  = $dir . $filename;
+        $file_url   = $url_dir . $filename;
 
         // Check if the file exists and if it's still fresh
         if ($this->is_file_fresh($file_path, $cache_expiration_days) && !$force_refresh) {
@@ -316,8 +306,7 @@ class SelfHostAssets {
         }
 
         // MIME type verification
-        $headers = wp_remote_retrieve_headers($response);
-        $content_type = isset($headers['content-type']) ? $headers['content-type'] : '';
+        $content_type = wp_remote_retrieve_header($response, 'content-type');
         $allowed_types = $this->get_allowed_mime_types($type);
 
         if (!in_array($content_type, $allowed_types, true)) {
@@ -326,16 +315,18 @@ class SelfHostAssets {
         }
 
         // Save the file
-        if (!$this->wp_filesystem()->is_dir($dir)) {
-            if (!$this->wp_filesystem()->mkdir($dir, FS_CHMOD_DIR)) {
+        global $wp_filesystem;
+
+        if (!$wp_filesystem->is_dir($dir)) {
+            if (!$wp_filesystem->mkdir($dir, FS_CHMOD_DIR)) {
                 $this->log_error(sprintf(__('Failed to create directory: %s', 'self-host-assets'), esc_html($dir)));
                 return false;
             }
             // Create a marker file to indicate ownership
-            $this->wp_filesystem()->put_contents($dir . '.self-host-assets', 'Plugin marker file', FS_CHMOD_FILE);
+            $wp_filesystem->put_contents($dir . '.self-host-assets', 'Plugin marker file', FS_CHMOD_FILE);
         }
 
-        $saved = $this->wp_filesystem()->put_contents($file_path, $file_content, FS_CHMOD_FILE);
+        $saved = $wp_filesystem->put_contents($file_path, $file_content, FS_CHMOD_FILE);
 
         if (!$saved) {
             $this->log_error(sprintf(__('Failed to save %s file: %s. Please check file permissions.', 'self-host-assets'), strtoupper($type), esc_html($file_path)));
@@ -368,10 +359,7 @@ class SelfHostAssets {
             $src = $style->src;
 
             // Only process external URLs
-            $src_host = wp_parse_url($src, PHP_URL_HOST);
-            $home_host = wp_parse_url(home_url(), PHP_URL_HOST);
-
-            if ($src_host === $home_host || empty($src_host)) {
+            if (!$this->is_external_url($src)) {
                 continue; // Skip local styles
             }
 
@@ -407,10 +395,7 @@ class SelfHostAssets {
             $src = $script->src;
 
             // Only process external URLs
-            $src_host = wp_parse_url($src, PHP_URL_HOST);
-            $home_host = wp_parse_url(home_url(), PHP_URL_HOST);
-
-            if ($src_host === $home_host || empty($src_host)) {
+            if (!$this->is_external_url($src)) {
                 continue; // Skip local scripts
             }
 
@@ -427,11 +412,11 @@ class SelfHostAssets {
 
     private function get_local_url($url, $type) {
         $upload_dir = wp_upload_dir();
-        $sub_dir = 'self-hosted-' . $type . '/';
-        $url_dir = trailingslashit($upload_dir['baseurl']) . $sub_dir;
-        $filename = md5($url) . '.' . $type;
-        $file_url = $url_dir . $filename;
-        $file_path = trailingslashit($upload_dir['basedir']) . $sub_dir . $filename;
+        $sub_dir    = 'self-hosted-' . $type . '/';
+        $url_dir    = trailingslashit($upload_dir['baseurl']) . $sub_dir;
+        $filename   = md5($url) . '.' . $type;
+        $file_url   = $url_dir . $filename;
+        $file_path  = trailingslashit($upload_dir['basedir']) . $sub_dir . $filename;
 
         if (file_exists($file_path)) {
             $file_url = add_query_arg('ver', filemtime($file_path), $file_url);
@@ -443,8 +428,8 @@ class SelfHostAssets {
 
     private function is_file_fresh($file_path, $cache_expiration_days) {
         if (file_exists($file_path)) {
-            $file_mod_time = filemtime($file_path);
-            $expiration_time = strtotime("-{$cache_expiration_days} days");
+            $file_mod_time   = filemtime($file_path);
+            $expiration_time = time() - ($cache_expiration_days * DAY_IN_SECONDS);
             if ($file_mod_time > $expiration_time) {
                 // File is still fresh
                 return true;
@@ -464,14 +449,6 @@ class SelfHostAssets {
             }
         }
         return true;
-    }
-
-    private function wp_filesystem() {
-        global $wp_filesystem;
-        if (empty($wp_filesystem)) {
-            $this->initialize_filesystem();
-        }
-        return $wp_filesystem;
     }
 
     /**
@@ -510,11 +487,11 @@ class SelfHostAssets {
 
         if (preg_match_all($pattern, $css_content, $matches, PREG_SET_ORDER)) {
             foreach ($matches as $match) {
-                $import_url = $match[2];
+                $import_url  = $match[2];
                 $media_query = isset($match[3]) ? $match[3] : '';
 
                 $absolute_import_url = $this->make_absolute_url($import_url, $css_url);
-                $local_import_url = $this->download_and_process_css_import($absolute_import_url, $processed_urls, $force_refresh, $current_depth + 1);
+                $local_import_url    = $this->download_and_process_css_import($absolute_import_url, $processed_urls, $force_refresh, $current_depth + 1);
 
                 if ($local_import_url) {
                     // Reconstruct the @import statement with the local URL and original media queries
@@ -543,7 +520,7 @@ class SelfHostAssets {
         }
 
         $cache_expiration_days = intval(get_option('cache_expiration_days_css', self::DEFAULT_CACHE_EXPIRATION_CSS));
-        $local_url = $this->download_file($url, 'css', $cache_expiration_days, $force_refresh);
+        $local_url             = $this->download_file($url, 'css', $cache_expiration_days, $force_refresh);
 
         if ($local_url) {
             $file_path = $this->get_local_file_path($url, 'css');
@@ -554,7 +531,11 @@ class SelfHostAssets {
                 if ($file_content !== false) {
                     $updated_content = $this->process_css_content($file_content, $url, $processed_urls, $force_refresh, $current_depth);
                     if (is_writable($file_path)) {
-                        file_put_contents($file_path, $updated_content);
+                        $result = file_put_contents($file_path, $updated_content);
+                        if ($result === false) {
+                            $this->log_error(sprintf(__('Failed to write updated CSS content to file: %s', 'self-host-assets'), esc_html($file_path)));
+                            return false;
+                        }
                     } else {
                         $this->log_error(sprintf(__('CSS file is not writable: %s', 'self-host-assets'), esc_html($file_path)));
                         return false;
@@ -585,8 +566,8 @@ class SelfHostAssets {
             return $css_content;
         }
 
-        $upload_dir = wp_upload_dir();
-        $font_dir = trailingslashit($upload_dir['basedir']) . 'self-hosted-fonts/';
+        $upload_dir   = wp_upload_dir();
+        $font_dir     = trailingslashit($upload_dir['basedir']) . 'self-hosted-fonts/';
         $font_url_dir = trailingslashit($upload_dir['baseurl']) . 'self-hosted-fonts/';
 
         // Get cache expiration setting
@@ -595,7 +576,7 @@ class SelfHostAssets {
         // Download each font and replace URLs in CSS content
         foreach ($font_urls as $font_url) {
             $absolute_font_url = $this->make_absolute_url($font_url, $css_url);
-            $local_font_url = $this->download_font_file($absolute_font_url, $font_dir, $font_url_dir, $cache_expiration_days, $force_refresh);
+            $local_font_url    = $this->download_font_file($absolute_font_url, $font_dir, $font_url_dir, $cache_expiration_days, $force_refresh);
             if ($local_font_url) {
                 $css_content = str_replace($font_url, $local_font_url, $css_content);
             }
@@ -620,9 +601,9 @@ class SelfHostAssets {
             return false;
         }
 
-        $filename = md5($url) . '.' . $extension;
+        $filename  = md5($url) . '.' . $extension;
         $file_path = $font_dir . $filename;
-        $file_url = $font_url_dir . $filename;
+        $file_url  = $font_url_dir . $filename;
 
         // Check if the file exists and if it's still fresh
         if ($this->is_file_fresh($file_path, $cache_expiration_days) && !$force_refresh) {
@@ -653,8 +634,7 @@ class SelfHostAssets {
         }
 
         // MIME type verification
-        $headers = wp_remote_retrieve_headers($response);
-        $content_type = isset($headers['content-type']) ? $headers['content-type'] : '';
+        $content_type = wp_remote_retrieve_header($response, 'content-type');
         $allowed_types = $this->get_allowed_mime_types('font');
 
         if (!in_array($content_type, $allowed_types, true)) {
@@ -663,16 +643,18 @@ class SelfHostAssets {
         }
 
         // Save the file
-        if (!$this->wp_filesystem()->is_dir($font_dir)) {
-            if (!$this->wp_filesystem()->mkdir($font_dir, FS_CHMOD_DIR)) {
+        global $wp_filesystem;
+
+        if (!$wp_filesystem->is_dir($font_dir)) {
+            if (!$wp_filesystem->mkdir($font_dir, FS_CHMOD_DIR)) {
                 $this->log_error(sprintf(__('Failed to create directory: %s', 'self-host-assets'), esc_html($font_dir)));
                 return false;
             }
             // Create a marker file to indicate ownership
-            $this->wp_filesystem()->put_contents($font_dir . '.self-host-assets', 'Plugin marker file', FS_CHMOD_FILE);
+            $wp_filesystem->put_contents($font_dir . '.self-host-assets', 'Plugin marker file', FS_CHMOD_FILE);
         }
 
-        $saved = $this->wp_filesystem()->put_contents($file_path, $file_content, FS_CHMOD_FILE);
+        $saved = $wp_filesystem->put_contents($file_path, $file_content, FS_CHMOD_FILE);
 
         if (!$saved) {
             $this->log_error(sprintf(__('Failed to save font file: %s. Please check file permissions.', 'self-host-assets'), esc_html($file_path)));
@@ -709,7 +691,7 @@ class SelfHostAssets {
      */
     private function make_absolute_url($relative_url, $base_url) {
         // If the URL is already absolute, return it
-        if (parse_url($relative_url, PHP_URL_SCHEME) !== null) {
+        if (parse_url($relative_url, PHP_URL_SCHEME) !== null || strpos($relative_url, '//') === 0) {
             return $relative_url;
         }
 
@@ -719,8 +701,38 @@ class SelfHostAssets {
             return $scheme . ':' . $relative_url;
         }
 
-        // Use wp_make_link_relative to handle relative URLs
-        return wp_normalize_path(trailingslashit(dirname($base_url)) . ltrim($relative_url, '/'));
+        // Parse base URL
+        $parsed_base = parse_url($base_url);
+        if (!isset($parsed_base['scheme']) || !isset($parsed_base['host'])) {
+            // Invalid base URL
+            return $relative_url;
+        }
+
+        $base_scheme = $parsed_base['scheme'];
+        $base_host   = $parsed_base['host'];
+        $base_port   = isset($parsed_base['port']) ? ':' . $parsed_base['port'] : '';
+        $base_path   = isset($parsed_base['path']) ? $parsed_base['path'] : '/';
+
+        // If the relative URL starts with '/', it's absolute path on the same host
+        if (strpos($relative_url, '/') === 0) {
+            return $base_scheme . '://' . $base_host . $base_port . $relative_url;
+        } else {
+            // Remove filename from base path
+            $base_path = rtrim(dirname($base_path), '/') . '/';
+
+            // Build absolute URL
+            return $base_scheme . '://' . $base_host . $base_port . $base_path . $relative_url;
+        }
+    }
+
+    /**
+     * Check if a URL is external.
+     */
+    private function is_external_url($url) {
+        $src_host  = wp_parse_url($url, PHP_URL_HOST);
+        $home_host = wp_parse_url(home_url(), PHP_URL_HOST);
+
+        return $src_host && $home_host && $src_host !== $home_host;
     }
 
     // Settings page for enabling/disabling self-hosting CSS, fonts, JavaScript, and cache control
@@ -765,45 +777,45 @@ class SelfHostAssets {
 
     public function register_settings() {
         register_setting('self_host_assets_settings_group', 'self_host_css', [
-            'type' => 'boolean',
+            'type'              => 'boolean',
             'sanitize_callback' => 'absint',
-            'default' => 1,
+            'default'           => 1,
         ]);
 
         register_setting('self_host_assets_settings_group', 'self_host_js', [
-            'type' => 'boolean',
+            'type'              => 'boolean',
             'sanitize_callback' => 'absint',
-            'default' => 0,
+            'default'           => 0,
         ]);
 
         register_setting('self_host_assets_settings_group', 'cache_expiration_days_css', [
-            'type' => 'integer',
+            'type'              => 'integer',
             'sanitize_callback' => [$this, 'sanitize_cache_expiration_days'],
-            'default' => self::DEFAULT_CACHE_EXPIRATION_CSS,
+            'default'           => self::DEFAULT_CACHE_EXPIRATION_CSS,
         ]);
 
         register_setting('self_host_assets_settings_group', 'cache_expiration_days_fonts', [
-            'type' => 'integer',
+            'type'              => 'integer',
             'sanitize_callback' => [$this, 'sanitize_cache_expiration_days'],
-            'default' => self::DEFAULT_CACHE_EXPIRATION_FONTS,
+            'default'           => self::DEFAULT_CACHE_EXPIRATION_FONTS,
         ]);
 
         register_setting('self_host_assets_settings_group', 'cache_expiration_days_js', [
-            'type' => 'integer',
+            'type'              => 'integer',
             'sanitize_callback' => [$this, 'sanitize_cache_expiration_days'],
-            'default' => self::DEFAULT_CACHE_EXPIRATION_JS,
+            'default'           => self::DEFAULT_CACHE_EXPIRATION_JS,
         ]);
 
         register_setting('self_host_assets_settings_group', 'force_refresh', [
-            'type' => 'boolean',
+            'type'              => 'boolean',
             'sanitize_callback' => 'absint',
-            'default' => 0,
+            'default'           => 0,
         ]);
 
         register_setting('self_host_assets_settings_group', 'cron_schedule', [
-            'type' => 'string',
+            'type'              => 'string',
             'sanitize_callback' => [$this, 'sanitize_cron_schedule'],
-            'default' => 'daily',
+            'default'           => 'daily',
         ]);
 
         add_settings_section('self_host_assets_section', __('Settings', 'self-host-assets'), null, 'self_host_assets_settings');
@@ -954,26 +966,32 @@ class SelfHostAssets {
 
     // Cleanup cached files when the plugin is uninstalled
     public static function uninstall() {
-        $instance = self::get_instance();
-        if (!$instance->initialize_filesystem()) {
+        if (!defined('WP_UNINSTALL_PLUGIN')) {
+            exit();
+        }
+
+        global $wp_filesystem;
+
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        if (!WP_Filesystem()) {
             return;
         }
 
         $upload_dir = wp_upload_dir();
-        $instance->remove_directory(trailingslashit($upload_dir['basedir']) . 'self-hosted-css/');
-        $instance->remove_directory(trailingslashit($upload_dir['basedir']) . 'self-hosted-fonts/');
-        $instance->remove_directory(trailingslashit($upload_dir['basedir']) . 'self-hosted-js/');
-    }
 
-    // Utility function to remove a directory and its files
-    private function remove_directory($dir) {
-        if (!$this->wp_filesystem()->is_dir($dir)) {
-            return;
-        }
+        $directories = [
+            trailingslashit($upload_dir['basedir']) . 'self-hosted-css/',
+            trailingslashit($upload_dir['basedir']) . 'self-hosted-fonts/',
+            trailingslashit($upload_dir['basedir']) . 'self-hosted-js/',
+        ];
 
-        // Check for marker file before deletion
-        if ($this->wp_filesystem()->exists($dir . '.self-host-assets')) {
-            $this->wp_filesystem()->delete($dir, true);
+        foreach ($directories as $dir) {
+            if ($wp_filesystem->is_dir($dir)) {
+                // Check for marker file before deletion
+                if ($wp_filesystem->exists($dir . '.self-host-assets')) {
+                    $wp_filesystem->delete($dir, true);
+                }
+            }
         }
     }
 
@@ -1013,21 +1031,25 @@ class SelfHostAssets {
      */
     private function get_local_file_path($url, $type) {
         $upload_dir = wp_upload_dir();
-        $sub_dir = 'self-hosted-' . $type . '/';
-        $filename = md5($url) . '.' . $type;
-        $file_path = trailingslashit($upload_dir['basedir']) . $sub_dir . $filename;
+        $sub_dir    = 'self-hosted-' . $type . '/';
+        $filename   = md5($url) . '.' . $type;
+        $file_path  = trailingslashit($upload_dir['basedir']) . $sub_dir . $filename;
         return $file_path;
     }
 
     public function add_cron_schedules($schedules) {
-        $schedules['hourly'] = [
-            'interval' => HOUR_IN_SECONDS,
-            'display'  => __('Once Hourly', 'self-host-assets'),
-        ];
-        $schedules['twicedaily'] = [
-            'interval' => 12 * HOUR_IN_SECONDS,
-            'display'  => __('Twice Daily', 'self-host-assets'),
-        ];
+        if (!isset($schedules['hourly'])) {
+            $schedules['hourly'] = [
+                'interval' => HOUR_IN_SECONDS,
+                'display'  => __('Once Hourly', 'self-host-assets'),
+            ];
+        }
+        if (!isset($schedules['twicedaily'])) {
+            $schedules['twicedaily'] = [
+                'interval' => 12 * HOUR_IN_SECONDS,
+                'display'  => __('Twice Daily', 'self-host-assets'),
+            ];
+        }
         return $schedules;
     }
 
@@ -1036,7 +1058,10 @@ class SelfHostAssets {
         if ('settings_page_self-host-assets' !== $hook) {
             return;
         }
-        wp_enqueue_style('self-host-assets-admin', plugin_dir_url(__FILE__) . 'admin.css', [], '1.0.0');
+        $plugin_dir = plugin_dir_path(__FILE__);
+        if (file_exists($plugin_dir . 'admin.css')) {
+            wp_enqueue_style('self-host-assets-admin', plugin_dir_url(__FILE__) . 'admin.css', [], '1.0.0');
+        }
     }
 }
 
