@@ -282,6 +282,9 @@ class SelfHostAssets {
 
         $processed_urls[] = $css_url;
 
+        // Remove CSS comments to avoid processing @import statements within them
+        $css_content = preg_replace('/\/\*.*?\*\//s', '', $css_content);
+
         // Process @import statements
         $css_content = self::process_import_statements($css_content, $css_url, $processed_urls, $force_refresh);
 
@@ -301,14 +304,16 @@ class SelfHostAssets {
      * @return string The updated CSS content.
      */
     private static function process_import_statements($css_content, $css_url, &$processed_urls, $force_refresh) {
-        $pattern = '$pattern = '/@import\s+(?:url\()?["\']?([^"\')\s]+)["\']?\)?(?:\s+[^;]+)?;/i';';
+        // Improved regex to handle media queries and various import styles
+        $pattern = '/@import\s+(?:url\()?["\']?([^"\')\s]+)["\']?\)?(?:\s+[^;]+)?;/i';
         if (preg_match_all($pattern, $css_content, $matches)) {
             foreach ($matches[1] as $import_url) {
                 $absolute_import_url = self::make_absolute_url($import_url, $css_url);
                 $local_import_url = self::download_and_process_css_import($absolute_import_url, $processed_urls, $force_refresh);
                 if ($local_import_url) {
                     // Replace the import URL in the CSS content
-                    $css_content = str_replace($import_url, $local_import_url, $css_content);
+                    // Handle different @import styles by replacing only the URL portion
+                    $css_content = preg_replace('/@import\s+(?:url\()?["\']?' . preg_quote($import_url, '/') . '["\']?\)?(?:\s+[^;]+)?;/', '@import url("' . $local_import_url . '");', $css_content, 1);
                 }
             }
         }
@@ -455,6 +460,7 @@ class SelfHostAssets {
      */
     private static function get_font_urls($css_content) {
         $font_urls = [];
+        // Improved regex to handle optional whitespace and quotes
         preg_match_all('/url\(\s*["\']?([^"\')]+)\s*["\']?\)/i', $css_content, $matches);
 
         if (!empty($matches[1])) {
@@ -482,22 +488,26 @@ class SelfHostAssets {
             return $relative_url;
         }
 
-        // Build absolute URL
-        $base_parts = parse_url($base_url);
-        $base_host = $base_parts['scheme'] . '://' . $base_parts['host'];
-        if (isset($base_parts['port'])) {
-            $base_host .= ':' . $base_parts['port'];
+        // Handle protocol-relative URLs
+        if (strpos($relative_url, '//') === 0) {
+            $scheme = parse_url($base_url, PHP_URL_SCHEME);
+            return $scheme . ':' . $relative_url;
         }
 
-        // Handle relative URLs
-        if (strpos($relative_url, '//') === 0) {
-            return $base_parts['scheme'] . ':' . $relative_url;
-        } elseif ($relative_url[0] === '/') {
-            return $base_host . $relative_url;
-        } else {
-            $base_path = isset($base_parts['path']) ? dirname($base_parts['path']) : '';
-            return $base_host . $base_path . '/' . $relative_url;
+        // Handle absolute paths
+        if (strpos($relative_url, '/') === 0) {
+            $parsed_base = parse_url($base_url);
+            $host = $parsed_base['scheme'] . '://' . $parsed_base['host'];
+            if (isset($parsed_base['port'])) {
+                $host .= ':' . $parsed_base['port'];
+            }
+            return $host . $relative_url;
         }
+
+        // Handle relative paths
+        $parsed_base = parse_url($base_url);
+        $path = isset($parsed_base['path']) ? dirname($parsed_base['path']) : '/';
+        return rtrim($parsed_base['scheme'] . '://' . $parsed_base['host'], '/') . $path . '/' . ltrim($relative_url, '/');
     }
 
     // Settings page for enabling/disabling self-hosting CSS, fonts, JavaScript, and cache control
