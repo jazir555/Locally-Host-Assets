@@ -301,7 +301,7 @@ class SelfHostAssets {
      * @return string The updated CSS content.
      */
     private static function process_import_statements($css_content, $css_url, &$processed_urls, $force_refresh) {
-        $pattern = '/@import\s+(?:url\()?["\']?([^"\')]+)["\']?\)?\s*;/i';
+        $pattern = '$pattern = '/@import\s+(?:url\()?["\']?([^"\')\s]+)["\']?\)?(?:\s+[^;]+)?;/i';';
         if (preg_match_all($pattern, $css_content, $matches)) {
             foreach ($matches[1] as $import_url) {
                 $absolute_import_url = self::make_absolute_url($import_url, $css_url);
