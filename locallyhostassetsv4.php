@@ -2,15 +2,16 @@
 /*
 Plugin Name: Self-Host Third-Party CSS, Fonts, and JavaScript
 Description: Downloads and self-hosts third-party CSS, fonts, and JavaScript files with settings for enabling/disabling functionality, cache control, and cleanup.
-Version: 1.7.0
+Version: 1.7.3
 Author: Jazir5
 Text Domain: self-host-assets
 Domain Path: /languages
 */
 
-if (!defined('ABSPATH')) {
-    exit; // Exit if accessed directly
-}
+defined('ABSPATH') || exit; // Exit if accessed directly
+
+// Use a namespace to avoid naming conflicts
+namespace SelfHostAssetsPlugin;
 
 class SelfHostAssets {
 
@@ -25,22 +26,29 @@ class SelfHostAssets {
     // Property to store error messages
     private static $errors = [];
 
-    // Property to store the instance of the class (Singleton pattern)
+    // Singleton instance
     private static $instance = null;
 
     // Get the instance of the class
     public static function get_instance() {
-        if (self::$instance === null) {
+        if (is_null(self::$instance)) {
             self::$instance = new SelfHostAssets();
         }
         return self::$instance;
     }
 
-    // Constructor is made private to prevent direct instantiation
+    // Constructor is private to enforce singleton pattern
     private function __construct() {
         $this->init_hooks();
     }
 
+    // Prevent cloning and unserialization
+    private function __clone() {}
+    private function __wakeup() {}
+
+    /**
+     * Initialize WordPress hooks and actions.
+     */
     private function init_hooks() {
         // Load plugin text domain for translations
         add_action('plugins_loaded', [$this, 'load_textdomain']);
@@ -56,34 +64,66 @@ class SelfHostAssets {
         add_action('admin_notices', [$this, 'display_admin_notices']);
 
         // Register activation and deactivation hooks
-        register_activation_hook(__FILE__, [$this, 'activate']);
-        register_deactivation_hook(__FILE__, [$this, 'deactivate']);
+        // These hooks need to be static or outside the class scope due to how WordPress handles them
+        register_activation_hook(__FILE__, [__CLASS__, 'activate_plugin']);
+        register_deactivation_hook(__FILE__, [__CLASS__, 'deactivate_plugin']);
 
         // Add cron event hook
         add_action('self_host_assets_cron_event', [$this, 'cron_process_resources']);
 
-        // Add custom cron schedules
-        add_filter('cron_schedules', [$this, 'add_cron_schedules']);
-
         // Reschedule cron event when schedule changes
-        add_action('update_option_cron_schedule', [$this, 'reschedule_cron_event'], 10, 2);
+        add_action('update_option', [$this, 'reschedule_cron_event'], 10, 3);
 
         // Enqueue admin styles for settings page
         add_action('admin_enqueue_scripts', [$this, 'enqueue_admin_styles']);
+
+        // Handle force refresh action
+        add_action('admin_post_force_refresh', [$this, 'handle_force_refresh']);
     }
 
+    /**
+     * Load plugin textdomain for translations.
+     */
     public function load_textdomain() {
         load_plugin_textdomain('self-host-assets', false, dirname(plugin_basename(__FILE__)) . '/languages/');
     }
 
+    /**
+     * Activation hook to schedule the cron event.
+     */
+    public static function activate_plugin() {
+        $instance = self::get_instance();
+        $instance->activate();
+    }
+
+    /**
+     * Deactivation hook to clear the scheduled cron event.
+     */
+    public static function deactivate_plugin() {
+        $instance = self::get_instance();
+        $instance->deactivate();
+    }
+
+    /**
+     * Activation method to schedule the cron event.
+     */
     public function activate() {
         // Schedule the cron event if not already scheduled
         $custom_schedule = get_option('cron_schedule', 'daily');
         if (!wp_next_scheduled('self_host_assets_cron_event')) {
             wp_schedule_event(time(), $custom_schedule, 'self_host_assets_cron_event');
         }
+
+        // Ensure the WordPress Filesystem API is initialized
+        $this->initialize_filesystem();
+
+        // Process all resources upon activation
+        $this->process_all_resources(true);
     }
 
+    /**
+     * Deactivation method to clear the scheduled cron event.
+     */
     public function deactivate() {
         // Clear the scheduled cron event
         $timestamp = wp_next_scheduled('self_host_assets_cron_event');
@@ -92,6 +132,9 @@ class SelfHostAssets {
         }
     }
 
+    /**
+     * Cron job function to process resources.
+     */
     public function cron_process_resources() {
         // Retrieve the force_refresh option
         $force_refresh = get_option('force_refresh', 0);
@@ -105,6 +148,9 @@ class SelfHostAssets {
         }
     }
 
+    /**
+     * Main function to self-host resources.
+     */
     public function self_host_resources() {
         $self_host_css_enabled = get_option('self_host_css', 1);
         $self_host_js_enabled  = get_option('self_host_js', 0);
@@ -120,6 +166,9 @@ class SelfHostAssets {
         }
     }
 
+    /**
+     * Process all resources, optionally forcing a refresh.
+     */
     private function process_all_resources($force_refresh = false) {
         $self_host_css_enabled = get_option('self_host_css', 1);
         $self_host_js_enabled  = get_option('self_host_js', 0);
@@ -133,6 +182,9 @@ class SelfHostAssets {
         }
     }
 
+    /**
+     * Process all stylesheets in the queue.
+     */
     private function process_all_styles($force_refresh) {
         global $wp_styles;
 
@@ -175,6 +227,9 @@ class SelfHostAssets {
         }
     }
 
+    /**
+     * Process all scripts in the queue.
+     */
     private function process_all_scripts($force_refresh) {
         global $wp_scripts;
 
@@ -217,6 +272,9 @@ class SelfHostAssets {
         }
     }
 
+    /**
+     * Download and process a CSS file.
+     */
     private function download_and_replace_css($url, $force_refresh = false) {
         $cache_expiration_days = intval(get_option('cache_expiration_days_css', self::DEFAULT_CACHE_EXPIRATION_CSS));
         $file_url              = $this->download_file($url, 'css', $cache_expiration_days, $force_refresh);
@@ -224,21 +282,16 @@ class SelfHostAssets {
         if ($file_url) {
             $file_path = $this->get_local_file_path($url, 'css');
 
-            if (file_exists($file_path) && is_readable($file_path)) {
+            if (file_exists($file_path)) {
                 $file_content = file_get_contents($file_path);
 
                 if ($file_content !== false) {
                     $processed_urls  = [];
                     $updated_content = $this->process_css_content($file_content, $url, $processed_urls, $force_refresh, 0);
 
-                    if (is_writable($file_path)) {
-                        $result = file_put_contents($file_path, $updated_content);
-                        if ($result === false) {
-                            $this->log_error(sprintf(__('Failed to write updated CSS content to file: %s', 'self-host-assets'), esc_html($file_path)));
-                            return false;
-                        }
-                    } else {
-                        $this->log_error(sprintf(__('CSS file is not writable: %s', 'self-host-assets'), esc_html($file_path)));
+                    $result = file_put_contents($file_path, $updated_content);
+                    if ($result === false) {
+                        $this->log_error(sprintf(__('Failed to write updated CSS content to file: %s', 'self-host-assets'), esc_html($file_path)));
                         return false;
                     }
                 } else {
@@ -254,11 +307,17 @@ class SelfHostAssets {
         return $file_url;
     }
 
+    /**
+     * Download and process a JavaScript file.
+     */
     private function download_and_replace_js($url, $force_refresh = false) {
         $cache_expiration_days = intval(get_option('cache_expiration_days_js', self::DEFAULT_CACHE_EXPIRATION_JS));
         return $this->download_file($url, 'js', $cache_expiration_days, $force_refresh);
     }
 
+    /**
+     * Download a file and save it locally.
+     */
     private function download_file($url, $type, $cache_expiration_days, $force_refresh) {
         if (!$this->initialize_filesystem()) {
             return false;
@@ -284,7 +343,11 @@ class SelfHostAssets {
         }
 
         // Download the file
-        $response = wp_remote_get($url, ['timeout' => 30, 'redirection' => 5]);
+        $response = wp_remote_get($url, [
+            'timeout'     => 30,
+            'redirection' => 10,
+            'user-agent'  => 'WordPress/' . get_bloginfo('version') . '; ' . get_bloginfo('url'),
+        ]);
 
         if (is_wp_error($response)) {
             $error_message = $response->get_error_message();
@@ -302,15 +365,6 @@ class SelfHostAssets {
 
         if (empty($file_content)) {
             $this->log_error(sprintf(__('Empty %s file content: %s', 'self-host-assets'), strtoupper($type), esc_url_raw($url)));
-            return false;
-        }
-
-        // MIME type verification
-        $content_type = wp_remote_retrieve_header($response, 'content-type');
-        $allowed_types = $this->get_allowed_mime_types($type);
-
-        if (!in_array($content_type, $allowed_types, true)) {
-            $this->log_error(sprintf(__('Invalid content type for %s file: %s - %s', 'self-host-assets'), strtoupper($type), esc_url_raw($url), esc_html($content_type)));
             return false;
         }
 
@@ -333,11 +387,25 @@ class SelfHostAssets {
             return false;
         }
 
+        // MIME type verification
+        $filetype      = wp_check_filetype($file_path, null);
+        $allowed_types = $this->get_allowed_mime_types($type);
+
+        if (!in_array($filetype['type'], $allowed_types, true)) {
+            $this->log_error(sprintf(__('Invalid file type for %s: %s', 'self-host-assets'), strtoupper($type), esc_html($file_path)));
+            // Remove the invalid file
+            $wp_filesystem->delete($file_path);
+            return false;
+        }
+
         $file_url = add_query_arg('ver', filemtime($file_path), $file_url);
 
         return $file_url;
     }
 
+    /**
+     * Enqueue cached stylesheets.
+     */
     private function enqueue_cached_styles() {
         global $wp_styles;
 
@@ -374,6 +442,9 @@ class SelfHostAssets {
         }
     }
 
+    /**
+     * Enqueue cached scripts.
+     */
     private function enqueue_cached_scripts() {
         global $wp_scripts;
 
@@ -410,6 +481,9 @@ class SelfHostAssets {
         }
     }
 
+    /**
+     * Get the local URL of a cached file.
+     */
     private function get_local_url($url, $type) {
         $upload_dir = wp_upload_dir();
         $sub_dir    = 'self-hosted-' . $type . '/';
@@ -426,6 +500,9 @@ class SelfHostAssets {
         return false;
     }
 
+    /**
+     * Check if a file is fresh based on cache expiration settings.
+     */
     private function is_file_fresh($file_path, $cache_expiration_days) {
         if (file_exists($file_path)) {
             $file_mod_time   = filemtime($file_path);
@@ -439,11 +516,15 @@ class SelfHostAssets {
         return false;
     }
 
+    /**
+     * Initialize the WordPress Filesystem API.
+     */
     private function initialize_filesystem() {
         global $wp_filesystem;
         if (empty($wp_filesystem)) {
             require_once ABSPATH . 'wp-admin/includes/file.php';
-            if (!WP_Filesystem()) {
+            $credentials = request_filesystem_credentials('', '', false, false, []);
+            if (!WP_Filesystem($credentials)) {
                 $this->log_error(__('Failed to initialize the WordPress Filesystem API.', 'self-host-assets'));
                 return false;
             }
@@ -495,7 +576,7 @@ class SelfHostAssets {
 
                 if ($local_import_url) {
                     // Reconstruct the @import statement with the local URL and original media queries
-                    $new_import = '@import url("' . esc_url_raw($local_import_url) . '")';
+                    $new_import = '@import url("' . esc_url($local_import_url) . '")';
                     if (!empty($media_query)) {
                         $new_import .= ' ' . esc_html($media_query);
                     }
@@ -525,19 +606,14 @@ class SelfHostAssets {
         if ($local_url) {
             $file_path = $this->get_local_file_path($url, 'css');
 
-            if (file_exists($file_path) && is_readable($file_path)) {
+            if (file_exists($file_path)) {
                 $file_content = file_get_contents($file_path);
 
                 if ($file_content !== false) {
                     $updated_content = $this->process_css_content($file_content, $url, $processed_urls, $force_refresh, $current_depth);
-                    if (is_writable($file_path)) {
-                        $result = file_put_contents($file_path, $updated_content);
-                        if ($result === false) {
-                            $this->log_error(sprintf(__('Failed to write updated CSS content to file: %s', 'self-host-assets'), esc_html($file_path)));
-                            return false;
-                        }
-                    } else {
-                        $this->log_error(sprintf(__('CSS file is not writable: %s', 'self-host-assets'), esc_html($file_path)));
+                    $result          = file_put_contents($file_path, $updated_content);
+                    if ($result === false) {
+                        $this->log_error(sprintf(__('Failed to write updated CSS content to file: %s', 'self-host-assets'), esc_html($file_path)));
                         return false;
                     }
                 } else {
@@ -585,6 +661,9 @@ class SelfHostAssets {
         return $css_content;
     }
 
+    /**
+     * Download and save a font file locally.
+     */
     private function download_font_file($url, $font_dir, $font_url_dir, $cache_expiration_days, $force_refresh) {
         if (!$this->initialize_filesystem()) {
             return false;
@@ -612,7 +691,11 @@ class SelfHostAssets {
         }
 
         // Download the font file
-        $response = wp_remote_get($url, ['timeout' => 30, 'redirection' => 5]);
+        $response = wp_remote_get($url, [
+            'timeout'     => 30,
+            'redirection' => 10,
+            'user-agent'  => 'WordPress/' . get_bloginfo('version') . '; ' . get_bloginfo('url'),
+        ]);
 
         if (is_wp_error($response)) {
             $error_message = $response->get_error_message();
@@ -633,15 +716,6 @@ class SelfHostAssets {
             return false;
         }
 
-        // MIME type verification
-        $content_type = wp_remote_retrieve_header($response, 'content-type');
-        $allowed_types = $this->get_allowed_mime_types('font');
-
-        if (!in_array($content_type, $allowed_types, true)) {
-            $this->log_error(sprintf(__('Invalid content type for font file: %s - %s', 'self-host-assets'), esc_url_raw($url), esc_html($content_type)));
-            return false;
-        }
-
         // Save the file
         global $wp_filesystem;
 
@@ -658,6 +732,17 @@ class SelfHostAssets {
 
         if (!$saved) {
             $this->log_error(sprintf(__('Failed to save font file: %s. Please check file permissions.', 'self-host-assets'), esc_html($file_path)));
+            return false;
+        }
+
+        // MIME type verification
+        $filetype      = wp_check_filetype($file_path, null);
+        $allowed_types = $this->get_allowed_mime_types('font');
+
+        if (!in_array($filetype['type'], $allowed_types, true)) {
+            $this->log_error(sprintf(__('Invalid file type for font: %s', 'self-host-assets'), esc_html($file_path)));
+            // Remove the invalid file
+            $wp_filesystem->delete($file_path);
             return false;
         }
 
@@ -690,15 +775,9 @@ class SelfHostAssets {
      * Converts a relative URL to an absolute URL based on a base URL.
      */
     private function make_absolute_url($relative_url, $base_url) {
-        // If the URL is already absolute, return it
+        // If the URL is already absolute or protocol-relative, return it
         if (parse_url($relative_url, PHP_URL_SCHEME) !== null || strpos($relative_url, '//') === 0) {
             return $relative_url;
-        }
-
-        // Handle protocol-relative URLs
-        if (strpos($relative_url, '//') === 0) {
-            $scheme = parse_url($base_url, PHP_URL_SCHEME);
-            return $scheme . ':' . $relative_url;
         }
 
         // Parse base URL
@@ -713,7 +792,7 @@ class SelfHostAssets {
         $base_port   = isset($parsed_base['port']) ? ':' . $parsed_base['port'] : '';
         $base_path   = isset($parsed_base['path']) ? $parsed_base['path'] : '/';
 
-        // If the relative URL starts with '/', it's absolute path on the same host
+        // If the relative URL starts with '/', it's an absolute path on the same host
         if (strpos($relative_url, '/') === 0) {
             return $base_scheme . '://' . $base_host . $base_port . $relative_url;
         } else {
@@ -749,7 +828,7 @@ class SelfHostAssets {
     public function render_settings_page() {
         ?>
         <div class="wrap">
-            <h1><?php _e('Self-Host Assets Settings', 'self-host-assets'); ?></h1>
+            <h1><?php esc_html_e('Self-Host Assets Settings', 'self-host-assets'); ?></h1>
             <form method="post" action="options.php">
                 <?php
                 settings_fields('self_host_assets_settings_group');
@@ -757,22 +836,33 @@ class SelfHostAssets {
                 submit_button();
                 ?>
             </form>
-            <form method="post" action="">
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
                 <?php wp_nonce_field('force_refresh_nonce', 'force_refresh_nonce_field'); ?>
+                <input type="hidden" name="action" value="force_refresh">
                 <?php
-                // Check if the form is submitted and verify nonce
-                if (isset($_POST['force_refresh']) && check_admin_referer('force_refresh_nonce', 'force_refresh_nonce_field')) {
-                    update_option('force_refresh', 1);
-                    echo '<div class="notice notice-success"><p>' . __('Cache will be refreshed on the next scheduled run.', 'self-host-assets') . '</p></div>';
-                }
                 submit_button(__('Force Refresh Cache', 'self-host-assets'), 'secondary', 'force_refresh');
                 ?>
             </form>
+            <?php settings_errors('self_host_assets_messages'); ?>
             <div class="notice notice-warning">
-                <p><?php _e('Please ensure you have the rights to self-host third-party resources and be aware of the security implications. Regularly update cached files to include any security patches or updates.', 'self-host-assets'); ?></p>
+                <p><?php esc_html_e('Please ensure you have the rights to self-host third-party resources and be aware of the security implications. Regularly update cached files to include any security patches or updates.', 'self-host-assets'); ?></p>
             </div>
         </div>
         <?php
+    }
+
+    public function handle_force_refresh() {
+        if (!current_user_can('manage_options')) {
+            wp_die(__('You do not have sufficient permissions to access this page.', 'self-host-assets'));
+        }
+
+        check_admin_referer('force_refresh_nonce', 'force_refresh_nonce_field');
+
+        update_option('force_refresh', 1);
+        add_settings_error('self_host_assets_messages', 'force_refresh', __('Cache will be refreshed on the next scheduled run.', 'self-host-assets'), 'updated');
+
+        wp_redirect(admin_url('options-general.php?page=self-host-assets'));
+        exit;
     }
 
     public function register_settings() {
@@ -891,7 +981,7 @@ class SelfHostAssets {
         $self_host_css = get_option('self_host_css', 1);
         ?>
         <input type="checkbox" id="self_host_css" name="self_host_css" value="1" <?php checked(1, $self_host_css); ?> />
-        <label for="self_host_css"><?php _e('Enable', 'self-host-assets'); ?></label>
+        <label for="self_host_css"><?php esc_html_e('Enable', 'self-host-assets'); ?></label>
         <?php
     }
 
@@ -899,7 +989,7 @@ class SelfHostAssets {
         $self_host_js = get_option('self_host_js', 0);
         ?>
         <input type="checkbox" id="self_host_js" name="self_host_js" value="1" <?php checked(1, $self_host_js); ?> />
-        <label for="self_host_js"><?php _e('Enable', 'self-host-assets'); ?></label>
+        <label for="self_host_js"><?php esc_html_e('Enable', 'self-host-assets'); ?></label>
         <?php
     }
 
@@ -907,7 +997,7 @@ class SelfHostAssets {
         $cache_expiration_days = intval(get_option('cache_expiration_days_css', self::DEFAULT_CACHE_EXPIRATION_CSS));
         ?>
         <input type="number" name="cache_expiration_days_css" value="<?php echo esc_attr($cache_expiration_days); ?>" min="1" max="365" />
-        <p class="description"><?php _e('Set the number of days after which cached CSS files should be refreshed.', 'self-host-assets'); ?></p>
+        <p class="description"><?php esc_html_e('Set the number of days after which cached CSS files should be refreshed.', 'self-host-assets'); ?></p>
         <?php
     }
 
@@ -915,7 +1005,7 @@ class SelfHostAssets {
         $cache_expiration_days = intval(get_option('cache_expiration_days_fonts', self::DEFAULT_CACHE_EXPIRATION_FONTS));
         ?>
         <input type="number" name="cache_expiration_days_fonts" value="<?php echo esc_attr($cache_expiration_days); ?>" min="1" max="365" />
-        <p class="description"><?php _e('Set the number of days after which cached font files should be refreshed.', 'self-host-assets'); ?></p>
+        <p class="description"><?php esc_html_e('Set the number of days after which cached font files should be refreshed.', 'self-host-assets'); ?></p>
         <?php
     }
 
@@ -923,7 +1013,7 @@ class SelfHostAssets {
         $cache_expiration_days = intval(get_option('cache_expiration_days_js', self::DEFAULT_CACHE_EXPIRATION_JS));
         ?>
         <input type="number" name="cache_expiration_days_js" value="<?php echo esc_attr($cache_expiration_days); ?>" min="1" max="365" />
-        <p class="description"><?php _e('Set the number of days after which cached JavaScript files should be refreshed.', 'self-host-assets'); ?></p>
+        <p class="description"><?php esc_html_e('Set the number of days after which cached JavaScript files should be refreshed.', 'self-host-assets'); ?></p>
         <?php
     }
 
@@ -931,16 +1021,16 @@ class SelfHostAssets {
         $cron_schedule = get_option('cron_schedule', 'daily');
         ?>
         <select name="cron_schedule">
-            <option value="hourly" <?php selected($cron_schedule, 'hourly'); ?>><?php _e('Hourly', 'self-host-assets'); ?></option>
-            <option value="twicedaily" <?php selected($cron_schedule, 'twicedaily'); ?>><?php _e('Twice Daily', 'self-host-assets'); ?></option>
-            <option value="daily" <?php selected($cron_schedule, 'daily'); ?>><?php _e('Daily', 'self-host-assets'); ?></option>
+            <option value="hourly" <?php selected($cron_schedule, 'hourly'); ?>><?php esc_html_e('Hourly', 'self-host-assets'); ?></option>
+            <option value="twicedaily" <?php selected($cron_schedule, 'twicedaily'); ?>><?php esc_html_e('Twice Daily', 'self-host-assets'); ?></option>
+            <option value="daily" <?php selected($cron_schedule, 'daily'); ?>><?php esc_html_e('Daily', 'self-host-assets'); ?></option>
         </select>
-        <p class="description"><?php _e('Select how often to refresh cached assets.', 'self-host-assets'); ?></p>
+        <p class="description"><?php esc_html_e('Select how often to refresh cached assets.', 'self-host-assets'); ?></p>
         <?php
     }
 
-    public function reschedule_cron_event($old_value, $new_value) {
-        if ($old_value !== $new_value) {
+    public function reschedule_cron_event($option_name, $old_value, $new_value) {
+        if ($option_name === 'cron_schedule' && $old_value !== $new_value) {
             $timestamp = wp_next_scheduled('self_host_assets_cron_event');
             if ($timestamp) {
                 wp_unschedule_event($timestamp, 'self_host_assets_cron_event');
@@ -949,22 +1039,30 @@ class SelfHostAssets {
         }
     }
 
-    // Function to log errors and display them in admin notices
+    /**
+     * Function to log errors and display them in admin notices.
+     */
     private function log_error($message) {
-        self::$errors[] = $message;
+        if (count(self::$errors) < 5) { // Limit stored errors to prevent memory issues
+            self::$errors[] = $message;
+        }
+        error_log('SelfHostAssets Plugin Error: ' . $message);
     }
 
     public function display_admin_notices() {
-        if (!empty(self::$errors)) {
-            foreach (self::$errors as $error) {
-                echo '<div class="notice notice-error"><p>' . esc_html($error) . '</p></div>';
-            }
-            // Reset errors after displaying
-            self::$errors = [];
+        if (!current_user_can('manage_options') || empty(self::$errors)) {
+            return;
         }
+        foreach (self::$errors as $error) {
+            echo '<div class="notice notice-error"><p>' . esc_html($error) . '</p></div>';
+        }
+        // Reset errors after displaying
+        self::$errors = [];
     }
 
-    // Cleanup cached files when the plugin is uninstalled
+    /**
+     * Cleanup cached files when the plugin is uninstalled.
+     */
     public static function uninstall() {
         if (!defined('WP_UNINSTALL_PLUGIN')) {
             exit();
@@ -973,7 +1071,8 @@ class SelfHostAssets {
         global $wp_filesystem;
 
         require_once ABSPATH . 'wp-admin/includes/file.php';
-        if (!WP_Filesystem()) {
+        $credentials = request_filesystem_credentials('', '', false, false, []);
+        if (!WP_Filesystem($credentials)) {
             return;
         }
 
@@ -993,12 +1092,31 @@ class SelfHostAssets {
                 }
             }
         }
+
+        // Optionally, delete related options
+        $options = [
+            'self_host_css',
+            'self_host_js',
+            'cache_expiration_days_css',
+            'cache_expiration_days_fonts',
+            'cache_expiration_days_js',
+            'force_refresh',
+            'cron_schedule',
+            'self_host_assets_errors',
+        ];
+
+        foreach ($options as $option) {
+            delete_option($option);
+        }
     }
 
+    /**
+     * Get allowed MIME types for different file types.
+     */
     private function get_allowed_mime_types($type) {
         switch ($type) {
             case 'css':
-                return ['text/css', 'text/plain'];
+                return ['text/css'];
             case 'js':
                 return [
                     'application/javascript',
@@ -1018,7 +1136,6 @@ class SelfHostAssets {
                     'application/vnd.ms-fontobject',
                     'font/otf',
                     'font/ttf',
-                    'application/octet-stream', // Common for font files
                     'image/svg+xml', // For SVG fonts
                 ];
             default:
@@ -1037,31 +1154,14 @@ class SelfHostAssets {
         return $file_path;
     }
 
-    public function add_cron_schedules($schedules) {
-        if (!isset($schedules['hourly'])) {
-            $schedules['hourly'] = [
-                'interval' => HOUR_IN_SECONDS,
-                'display'  => __('Once Hourly', 'self-host-assets'),
-            ];
-        }
-        if (!isset($schedules['twicedaily'])) {
-            $schedules['twicedaily'] = [
-                'interval' => 12 * HOUR_IN_SECONDS,
-                'display'  => __('Twice Daily', 'self-host-assets'),
-            ];
-        }
-        return $schedules;
-    }
-
-    // Enqueue styles for admin settings page
+    /**
+     * Enqueue styles for admin settings page.
+     */
     public function enqueue_admin_styles($hook) {
         if ('settings_page_self-host-assets' !== $hook) {
             return;
         }
-        $plugin_dir = plugin_dir_path(__FILE__);
-        if (file_exists($plugin_dir . 'admin.css')) {
-            wp_enqueue_style('self-host-assets-admin', plugin_dir_url(__FILE__) . 'admin.css', [], '1.0.0');
-        }
+        wp_enqueue_style('self-host-assets-admin', plugin_dir_url(__FILE__) . 'admin.css', [], '1.0.0');
     }
 }
 
@@ -1069,4 +1169,4 @@ class SelfHostAssets {
 SelfHostAssets::get_instance();
 
 // Register uninstall hook
-register_uninstall_hook(__FILE__, ['SelfHostAssets', 'uninstall']);
+register_uninstall_hook(__FILE__, [SelfHostAssets::class, 'uninstall']);
