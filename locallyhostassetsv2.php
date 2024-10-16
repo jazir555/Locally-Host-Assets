@@ -455,7 +455,7 @@ class SelfHostAssets {
      */
     private static function get_font_urls($css_content) {
         $font_urls = [];
-        preg_match_all('/url\(([^)]+)\)/i', $css_content, $matches);
+        preg_match_all('/url\(\s*["\']?([^"\')]+)\s*["\']?\)/i', $css_content, $matches);
 
         if (!empty($matches[1])) {
             foreach ($matches[1] as $url) {
