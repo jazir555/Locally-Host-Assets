@@ -2,7 +2,7 @@
 /*
 Plugin Name: Self-Host Third-Party CSS, Fonts, and JavaScript
 Description: Downloads and self-hosts third-party CSS, fonts, and JavaScript files with settings for enabling/disabling functionality, cache control, and cleanup.
-Version: 1.9.0
+Version: 1.9.1
 Author: Jazir5
 Text Domain: self-host-assets
 Domain Path: /languages
@@ -13,9 +13,222 @@ defined('ABSPATH') || exit; // Exit if accessed directly
 // Use a namespace to avoid naming conflicts
 namespace SelfHostAssetsPlugin;
 
-// Import necessary global classes
 use WP_Error;
 use Exception;
+
+/**
+ * WP_Background_Process Class
+ *
+ * A base class for handling background processing.
+ */
+abstract class WP_Background_Process {
+
+    /**
+     * Action name for the background process.
+     *
+     * @var string
+     */
+    protected $action = '';
+
+    /**
+     * Identifier for the background process.
+     *
+     * @var string
+     */
+    protected $identifier = '';
+
+    /**
+     * Data queue.
+     *
+     * @var array
+     */
+    protected $queue = [];
+
+    /**
+     * Constructor.
+     *
+     * @throws Exception If the action is not set.
+     */
+    public function __construct() {
+        if (empty($this->action)) {
+            throw new \Exception(__('You must set the action for the background process.', 'self-host-assets'));
+        }
+
+        $this->identifier = 'wp_' . $this->action;
+
+        add_action($this->identifier, [$this, 'process_queue']);
+    }
+
+    /**
+     * Push data to the queue.
+     *
+     * @param mixed $data Data.
+     * @return $this
+     */
+    public function push_to_queue($data) {
+        $this->queue[] = $data;
+        return $this;
+    }
+
+    /**
+     * Save the queue to the database.
+     *
+     * @return $this
+     */
+    public function save() {
+        set_transient($this->identifier, $this->queue, HOUR_IN_SECONDS);
+        $this->queue = [];
+        return $this;
+    }
+
+    /**
+     * Dispatch the queue.
+     */
+    public function dispatch() {
+        if (!wp_next_scheduled($this->identifier)) {
+            wp_schedule_single_event(time(), $this->identifier, []);
+        }
+    }
+
+    /**
+     * Process the queue.
+     */
+    public function process_queue() {
+        $this->queue = get_transient($this->identifier);
+        if (!$this->queue) {
+            return;
+        }
+
+        foreach ($this->queue as $item) {
+            $continue = $this->task($item);
+            if ($continue === false) {
+                continue; // Remove the task from the queue
+            }
+        }
+
+        delete_transient($this->identifier);
+
+        $this->complete();
+    }
+
+    /**
+     * Task to handle each queued item.
+     *
+     * @param mixed $item The queued item.
+     * @return bool False if the task should be removed from the queue, true otherwise.
+     */
+    abstract protected function task($item);
+
+    /**
+     * Complete the background process.
+     */
+    protected function complete() {
+        // This method can be overridden to perform actions when the queue is complete.
+    }
+}
+
+/**
+ * Asset_Process Class
+ *
+ * Handles background processing of assets.
+ */
+class Asset_Process extends WP_Background_Process {
+
+    /**
+     * Action name for the background process.
+     *
+     * @var string
+     */
+    protected $action = 'self_host_assets_background_process';
+
+    /**
+     * Main plugin instance.
+     *
+     * @var SelfHostAssets
+     */
+    protected $main_plugin;
+
+    /**
+     * Set the main plugin instance.
+     *
+     * @param SelfHostAssets $plugin The main plugin instance.
+     * @return void
+     */
+    public function set_main_plugin($plugin) {
+        $this->main_plugin = $plugin;
+    }
+
+    /**
+     * Task to handle each queued item.
+     *
+     * @param array $item The queued item.
+     *
+     * @return bool False if the task should be removed from the queue, true otherwise.
+     */
+    protected function task($item) {
+        if (!isset($item['type']) || !isset($item['url'])) {
+            // Invalid task
+            return false;
+        }
+
+        $type = sanitize_text_field($item['type']);
+        $url = esc_url_raw($item['url']);
+        $force_refresh = isset($item['force_refresh']) ? boolval($item['force_refresh']) : false;
+        $current_depth = isset($item['current_depth']) ? intval($item['current_depth']) : 0;
+        $retry_count = isset($item['retry_count']) ? intval($item['retry_count']) : 0;
+        $max_retries = isset($item['max_retries']) ? intval($item['max_retries']) : 3; // Default max retries
+
+        try {
+            switch ($type) {
+                case 'css':
+                    $this->main_plugin->download_and_replace_css($url, $force_refresh, $current_depth);
+                    break;
+                case 'js':
+                    $this->main_plugin->download_and_replace_js($url, $force_refresh);
+                    break;
+                case 'font':
+                    // Handle additional asset types if needed
+                    $this->main_plugin->download_font_file($url, 'font', $force_refresh);
+                    break;
+                default:
+                    // Unsupported type
+                    $this->main_plugin->log_error(sprintf(__('Unsupported asset type: %s', 'self-host-assets'), esc_html($type)), 'warning');
+                    return false;
+            }
+        } catch (Exception $e) {
+            // Log the exception
+            $this->main_plugin->log_error($e->getMessage());
+
+            // Retry logic
+            if ($retry_count < $max_retries) {
+                // Increment retry count and re-queue the task
+                $item['retry_count'] = $retry_count + 1;
+                $this->push_to_queue($item);
+                $this->save();
+                $this->dispatch();
+                return true; // Keep the task in the queue for retry
+            } else {
+                // Max retries reached, log failure
+                $this->main_plugin->log_error(sprintf(__('Max retries reached for asset: %s', 'self-host-assets'), esc_url_raw($url)), 'warning');
+                return false; // Remove the task from the queue
+            }
+        }
+
+        // Return false to remove the task from the queue
+        return false;
+    }
+
+    /**
+     * Complete the background process.
+     */
+    protected function complete() {
+        parent::complete();
+        // Notify the main plugin that processing is complete
+        if (method_exists($this->main_plugin, 'on_background_process_complete')) {
+            $this->main_plugin->on_background_process_complete();
+        }
+    }
+}
 
 /**
  * SelfHostAssets Class
@@ -24,6 +237,9 @@ use Exception;
  */
 class SelfHostAssets {
 
+    // Plugin version
+    const VERSION = '1.9.1';
+
     // Default cache expiration times in days
     const DEFAULT_CACHE_EXPIRATION_CSS   = 7;
     const DEFAULT_CACHE_EXPIRATION_FONTS = 30;
@@ -31,6 +247,9 @@ class SelfHostAssets {
 
     // Maximum depth for nested @import statements
     const MAX_IMPORT_DEPTH = 5;
+
+    // Maximum retries for failed downloads
+    const MAX_RETRIES = 3;
 
     /**
      * Singleton instance
@@ -68,7 +287,21 @@ class SelfHostAssets {
     private $background_process = null;
 
     /**
-     * Get the singleton instance.
+     * Upload directory information.
+     *
+     * @var array|null
+     */
+    private $upload_dir = null;
+
+    /**
+     * Flag to indicate if background processing is complete.
+     *
+     * @var bool
+     */
+    private $background_complete = false;
+
+    /**
+     * Singleton instance.
      *
      * @return SelfHostAssets
      */
@@ -86,12 +319,14 @@ class SelfHostAssets {
      */
     private function __construct() {
         global $wpdb;
-        $this->log_table     = $wpdb->prefix . 'self_host_assets_logs';
-        $this->mapping_table = $wpdb->prefix . 'self_host_assets_mapping';
+        $prefix = is_multisite() ? $wpdb->get_blog_prefix() : $wpdb->prefix;
+        $this->log_table     = $prefix . 'self_host_assets_logs';
+        $this->mapping_table = $prefix . 'self_host_assets_mapping';
 
         // Initialize background process
         $this->initialize_background_process();
 
+        // Initialize hooks
         $this->init_hooks();
     }
 
@@ -101,6 +336,8 @@ class SelfHostAssets {
 
     /**
      * Initialize WordPress hooks and actions.
+     *
+     * @return void
      */
     private function init_hooks() {
         // Load plugin text domain for translations
@@ -118,9 +355,9 @@ class SelfHostAssets {
         // Display admin notices for errors
         add_action('admin_notices', [$this, 'display_admin_notices']);
 
-        // Register activation and deactivation hooks
-        register_activation_hook(__FILE__, [__CLASS__, 'activate_plugin']);
-        register_deactivation_hook(__FILE__, [__CLASS__, 'deactivate_plugin']);
+        // Register activation and deactivation hooks with fully qualified class names
+        register_activation_hook(__FILE__, ['SelfHostAssetsPlugin\SelfHostAssets', 'activate_plugin']);
+        register_deactivation_hook(__FILE__, ['SelfHostAssetsPlugin\SelfHostAssets', 'deactivate_plugin']);
 
         // Add cron event hook
         add_action('self_host_assets_cron_event', [$this, 'cron_process_resources']);
@@ -133,10 +370,17 @@ class SelfHostAssets {
 
         // Add custom cron schedules
         add_filter('cron_schedules', [$this, 'add_custom_cron_schedule']);
+
+        // Ensure compatibility with Multisite installations
+        if (is_multisite()) {
+            add_action('network_admin_menu', [$this, 'add_settings_pages']);
+        }
     }
 
     /**
      * Load plugin textdomain for translations.
+     *
+     * @return void
      */
     public function load_textdomain() {
         load_plugin_textdomain('self-host-assets', false, dirname(plugin_basename(__FILE__)) . '/languages/');
@@ -144,6 +388,8 @@ class SelfHostAssets {
 
     /**
      * Activation hook to schedule the cron event and process resources.
+     *
+     * @return void
      */
     public static function activate_plugin() {
         $instance = self::get_instance();
@@ -154,6 +400,8 @@ class SelfHostAssets {
 
     /**
      * Deactivation hook to clear the scheduled cron event.
+     *
+     * @return void
      */
     public static function deactivate_plugin() {
         $instance = self::get_instance();
@@ -162,6 +410,8 @@ class SelfHostAssets {
 
     /**
      * Activation method to schedule the cron event and process resources.
+     *
+     * @return void
      */
     public function activate() {
         // Schedule the cron event if not already scheduled
@@ -182,6 +432,8 @@ class SelfHostAssets {
 
     /**
      * Deactivation method to clear the scheduled cron event.
+     *
+     * @return void
      */
     public function deactivate() {
         // Clear the scheduled cron event
@@ -193,6 +445,8 @@ class SelfHostAssets {
 
     /**
      * Create logs table in the database.
+     *
+     * @return void
      */
     public function create_logs_table() {
         global $wpdb;
@@ -203,7 +457,8 @@ class SelfHostAssets {
             id bigint(20) NOT NULL AUTO_INCREMENT,
             timestamp datetime DEFAULT '0000-00-00 00:00:00' NOT NULL,
             message text NOT NULL,
-            PRIMARY KEY  (id)
+            PRIMARY KEY  (id),
+            KEY idx_timestamp (timestamp)
         ) $charset_collate;";
 
         require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
@@ -212,6 +467,8 @@ class SelfHostAssets {
 
     /**
      * Create mapping table in the database.
+     *
+     * @return void
      */
     public function create_mapping_table() {
         global $wpdb;
@@ -224,7 +481,8 @@ class SelfHostAssets {
             hashed_filename varchar(255) NOT NULL,
             type varchar(10) NOT NULL,
             PRIMARY KEY  (id),
-            UNIQUE KEY hashed_filename_unique (hashed_filename, type)
+            UNIQUE KEY hashed_filename_unique (hashed_filename, type),
+            KEY idx_type_original_url (type, original_url(255))
         ) $charset_collate;";
 
         require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
@@ -233,6 +491,8 @@ class SelfHostAssets {
 
     /**
      * Cron job function to process resources.
+     *
+     * @return void
      */
     public function cron_process_resources() {
         // Retrieve the force_refresh option
@@ -249,6 +509,8 @@ class SelfHostAssets {
 
     /**
      * Initialize background process.
+     *
+     * @return void
      */
     public function initialize_background_process() {
         // Initialize the background process
@@ -258,6 +520,8 @@ class SelfHostAssets {
 
     /**
      * Main function to self-host resources.
+     *
+     * @return void
      */
     public function self_host_resources() {
         $self_host_css_enabled = get_option('self_host_css', 1);
@@ -278,6 +542,8 @@ class SelfHostAssets {
      * Process all resources, optionally forcing a refresh.
      *
      * @param bool $force_refresh Whether to force refresh cached files.
+     *
+     * @return void
      */
     private function process_all_resources($force_refresh = false) {
         $self_host_css_enabled = get_option('self_host_css', 1);
@@ -296,6 +562,8 @@ class SelfHostAssets {
      * Process all stylesheets in the queue.
      *
      * @param bool $force_refresh Whether to force refresh cached files.
+     *
+     * @return void
      */
     private function process_all_styles($force_refresh) {
         global $wp_styles;
@@ -327,11 +595,14 @@ class SelfHostAssets {
                 continue;
             }
 
-            // Queue the stylesheet for background processing
+            // Queue the stylesheet for background processing with current_depth = 0 and retry_count = 0
             $this->background_process->push_to_queue([
                 'type'          => 'css',
                 'url'           => $src,
                 'force_refresh' => $force_refresh,
+                'current_depth' => 0, // Initialize recursion depth
+                'retry_count'   => 0, // Initialize retry count
+                'max_retries'   => self::MAX_RETRIES,
             ]);
         }
 
@@ -343,6 +614,8 @@ class SelfHostAssets {
      * Process all scripts in the queue.
      *
      * @param bool $force_refresh Whether to force refresh cached files.
+     *
+     * @return void
      */
     private function process_all_scripts($force_refresh) {
         global $wp_scripts;
@@ -374,11 +647,13 @@ class SelfHostAssets {
                 continue;
             }
 
-            // Queue the script for background processing
+            // Queue the script for background processing with retry_count = 0
             $this->background_process->push_to_queue([
                 'type'          => 'js',
                 'url'           => $src,
                 'force_refresh' => $force_refresh,
+                'retry_count'   => 0, // Initialize retry count
+                'max_retries'   => self::MAX_RETRIES,
             ]);
         }
 
@@ -391,24 +666,26 @@ class SelfHostAssets {
      *
      * @param string $url           The URL of the CSS file.
      * @param bool   $force_refresh Whether to force refresh cached files.
+     * @param int    $current_depth Current recursion depth.
      *
      * @return string|false The local URL of the cached CSS file or false on failure.
      */
-    public function download_and_replace_css($url, $force_refresh = false) {
+    public function download_and_replace_css($url, $force_refresh = false, $current_depth = 0) {
         $cache_expiration_days = intval(get_option('cache_expiration_days_css', self::DEFAULT_CACHE_EXPIRATION_CSS));
         $file_url              = $this->download_file($url, 'css', $cache_expiration_days, $force_refresh);
 
         if ($file_url) {
             $file_path = $this->get_local_file_path($url, 'css');
 
-            if (file_exists($file_path)) {
-                $file_content = file_get_contents($file_path);
+            if ($this->initialize_filesystem() && $GLOBALS['wp_filesystem']->exists($file_path)) {
+                $file_content = $GLOBALS['wp_filesystem']->get_contents($file_path);
 
                 if ($file_content !== false) {
                     $processed_urls  = [];
-                    $updated_content = $this->process_css_content($file_content, $url, $processed_urls, $force_refresh, 0);
+                    $updated_content = $this->process_css_content($file_content, $url, $processed_urls, $force_refresh, $current_depth + 1); // Increment depth
 
-                    $result = file_put_contents($file_path, $updated_content);
+                    $result = $GLOBALS['wp_filesystem']->put_contents($file_path, $updated_content, FS_CHMOD_FILE);
+
                     if ($result === false) {
                         $this->log_error(sprintf(__('Failed to write updated CSS content to file: %s', 'self-host-assets'), esc_html($file_path)));
                         return false;
@@ -442,10 +719,10 @@ class SelfHostAssets {
     /**
      * Download a file and save it locally.
      *
-     * @param string $url                 The URL of the file.
-     * @param string $type                The type of the file ('css', 'js', 'font').
+     * @param string $url                  The URL of the file.
+     * @param string $type                 The type of the file ('css', 'js', 'font', 'image').
      * @param int    $cache_expiration_days Cache expiration time in days.
-     * @param bool   $force_refresh       Whether to force refresh the cached file.
+     * @param bool   $force_refresh        Whether to force refresh the cached file.
      *
      * @return string|false The local URL of the cached file or false on failure.
      */
@@ -461,7 +738,7 @@ class SelfHostAssets {
             return false;
         }
 
-        $upload_dir = wp_upload_dir();
+        $upload_dir = $this->get_upload_dir();
         $sub_dir    = 'self-hosted-' . $type . '/';
         $dir        = trailingslashit($upload_dir['basedir']) . $sub_dir;
         $url_dir    = trailingslashit($upload_dir['baseurl']) . $sub_dir;
@@ -471,41 +748,41 @@ class SelfHostAssets {
 
         // Check if the file exists and if it's still fresh
         if ($this->is_file_fresh($file_path, $cache_expiration_days) && !$force_refresh) {
-            $file_url = add_query_arg('ver', filemtime($file_path), $file_url);
+            $file_mod_time = method_exists($wp_filesystem, 'mtime') ? $wp_filesystem->mtime($file_path) : filemtime($file_path);
+            if ($file_mod_time !== false) {
+                $file_url = add_query_arg('ver', $file_mod_time, $file_url);
+            }
             return $file_url;
         }
 
-        // Download the file
+        // Download the file with SSL verification
         $response = wp_remote_get($url, [
             'timeout'     => 30,
             'redirection' => 10,
-            'user-agent'  => 'WordPress/' . get_bloginfo('version') . '; ' . get_bloginfo('url'),
+            'user-agent'  => 'SelfHostAssetsPlugin/' . self::VERSION,
+            'sslverify'   => true,
         ]);
 
         if (is_wp_error($response)) {
             $error_message = $response->get_error_message();
-            $this->log_error(sprintf(__('Failed to download %s file: %s - %s', 'self-host-assets'), strtoupper($type), esc_url_raw($url), $error_message));
-            return false;
+            throw new Exception(sprintf(__('Failed to download %s file: %s - %s', 'self-host-assets'), strtoupper($type), esc_url_raw($url), $error_message));
         }
 
         $response_code = wp_remote_retrieve_response_code($response);
         if ($response_code >= 400) {
-            $this->log_error(sprintf(__('HTTP Error %d while downloading %s file: %s', 'self-host-assets'), $response_code, strtoupper($type), esc_url_raw($url)));
-            return false;
+            throw new Exception(sprintf(__('HTTP Error %d while downloading %s file: %s', 'self-host-assets'), $response_code, strtoupper($type), esc_url_raw($url)));
         }
 
         $file_content = wp_remote_retrieve_body($response);
 
         if (empty($file_content)) {
-            $this->log_error(sprintf(__('Empty %s file content: %s', 'self-host-assets'), strtoupper($type), esc_url_raw($url)));
-            return false;
+            throw new Exception(sprintf(__('Empty %s file content: %s', 'self-host-assets'), strtoupper($type), esc_url_raw($url)));
         }
 
         // Save the file
         if (!$wp_filesystem->is_dir($dir)) {
             if (!$wp_filesystem->mkdir($dir, FS_CHMOD_DIR)) {
-                $this->log_error(sprintf(__('Failed to create directory: %s', 'self-host-assets'), esc_html($dir)));
-                return false;
+                throw new Exception(sprintf(__('Failed to create directory: %s', 'self-host-assets'), esc_html($dir)));
             }
             // Create a marker file to indicate ownership
             $wp_filesystem->put_contents($dir . '.self-host-assets', 'Plugin marker file', FS_CHMOD_FILE);
@@ -514,8 +791,7 @@ class SelfHostAssets {
         $saved = $wp_filesystem->put_contents($file_path, $file_content, FS_CHMOD_FILE);
 
         if (!$saved) {
-            $this->log_error(sprintf(__('Failed to save %s file: %s. Please check file permissions.', 'self-host-assets'), strtoupper($type), esc_html($file_path)));
-            return false;
+            throw new Exception(sprintf(__('Failed to save %s file: %s. Please check file permissions.', 'self-host-assets'), strtoupper($type), esc_html($file_path)));
         }
 
         // MIME type verification using wp_check_filetype_and_ext
@@ -532,8 +808,8 @@ class SelfHostAssets {
         // Set strict file permissions
         $wp_filesystem->chmod($file_path, 0644);
 
-        // Insert mapping into the database
-        $wpdb->insert(
+        // Insert or replace mapping into the database using prepared statements
+        $wpdb->replace(
             $this->mapping_table,
             [
                 'original_url'    => $url,
@@ -547,13 +823,19 @@ class SelfHostAssets {
             ]
         );
 
-        $file_url = add_query_arg('ver', filemtime($file_path), $file_url);
+        // Ensure accurate versioning
+        $file_mod_time = method_exists($wp_filesystem, 'mtime') ? $wp_filesystem->mtime($file_path) : filemtime($file_path);
+        if ($file_mod_time !== false) {
+            $file_url = add_query_arg('ver', $file_mod_time, $file_url);
+        }
 
         return $file_url;
     }
 
     /**
      * Enqueue cached stylesheets.
+     *
+     * @return void
      */
     private function enqueue_cached_styles() {
         global $wp_styles;
@@ -593,6 +875,8 @@ class SelfHostAssets {
 
     /**
      * Enqueue cached scripts.
+     *
+     * @return void
      */
     private function enqueue_cached_scripts() {
         global $wp_scripts;
@@ -624,7 +908,7 @@ class SelfHostAssets {
             if ($local_url) {
                 // Deregister the original script and register the new one
                 wp_deregister_script($handle);
-                wp_register_script($handle, $local_url, $script->deps, $script->ver, $script->extra['group']);
+                wp_register_script($handle, $local_url, $script->deps, $script->ver, isset($script->extra['group']) ? $script->extra['group'] : false);
                 wp_enqueue_script($handle);
             }
         }
@@ -634,21 +918,25 @@ class SelfHostAssets {
      * Get the local URL of a cached file.
      *
      * @param string $url  The external URL of the asset.
-     * @param string $type The type of the asset ('css', 'js', 'font').
+     * @param string $type The type of the asset ('css', 'js', 'font', 'image').
      *
      * @return string|false The local URL or false if not found.
      */
     private function get_local_url($url, $type) {
         global $wpdb;
-        $upload_dir = wp_upload_dir();
+        $upload_dir = $this->get_upload_dir();
         $sub_dir    = 'self-hosted-' . $type . '/';
         $url_dir    = trailingslashit($upload_dir['baseurl']) . $sub_dir;
         $filename   = md5($url) . '.' . $type;
         $file_url   = $url_dir . $filename;
         $file_path  = trailingslashit($upload_dir['basedir']) . $sub_dir . $filename;
 
-        if (file_exists($file_path)) {
-            $file_url = add_query_arg('ver', filemtime($file_path), $file_url);
+        if ($this->initialize_filesystem() && $GLOBALS['wp_filesystem']->exists($file_path)) {
+            // Ensure accurate versioning
+            $file_mod_time = method_exists($GLOBALS['wp_filesystem'], 'mtime') ? $GLOBALS['wp_filesystem']->mtime($file_path) : filemtime($file_path);
+            if ($file_mod_time !== false) {
+                $file_url = add_query_arg('ver', $file_mod_time, $file_url);
+            }
             return $file_url;
         }
 
@@ -664,7 +952,7 @@ class SelfHostAssets {
      * @return string The local file path.
      */
     private function get_local_file_path($url, $type) {
-        $upload_dir = wp_upload_dir();
+        $upload_dir = $this->get_upload_dir();
         $sub_dir    = 'self-hosted-' . $type . '/';
         $dir        = trailingslashit($upload_dir['basedir']) . $sub_dir;
         $filename   = md5($url) . '.' . $type;
@@ -674,14 +962,14 @@ class SelfHostAssets {
     /**
      * Check if a file is fresh based on cache expiration settings.
      *
-     * @param string $file_path           The path to the cached file.
+     * @param string $file_path             The path to the cached file.
      * @param int    $cache_expiration_days Cache expiration time in days.
      *
      * @return bool True if the file is fresh, false otherwise.
      */
     private function is_file_fresh($file_path, $cache_expiration_days) {
-        if (file_exists($file_path)) {
-            $file_mod_time   = filemtime($file_path);
+        if ($this->initialize_filesystem() && $GLOBALS['wp_filesystem']->exists($file_path)) {
+            $file_mod_time   = method_exists($GLOBALS['wp_filesystem'], 'mtime') ? $GLOBALS['wp_filesystem']->mtime($file_path) : filemtime($file_path);
             $expiration_time = time() - ($cache_expiration_days * DAY_IN_SECONDS);
             if ($file_mod_time > $expiration_time) {
                 // File is still fresh
@@ -701,7 +989,7 @@ class SelfHostAssets {
         global $wp_filesystem;
         if (empty($wp_filesystem)) {
             require_once ABSPATH . 'wp-admin/includes/file.php';
-            if (!\WP_Filesystem()) {
+            if (!WP_Filesystem()) {
                 $this->log_error(__('Failed to initialize the WordPress Filesystem API.', 'self-host-assets'));
                 return false;
             }
@@ -712,11 +1000,11 @@ class SelfHostAssets {
     /**
      * Processes CSS content to handle @import statements and font URLs.
      *
-     * @param string $css_content     The CSS content.
-     * @param string $css_url         The URL of the CSS file.
-     * @param array  &$processed_urls An array of already processed URLs to avoid recursion.
-     * @param bool   $force_refresh   Whether to force refresh cached files.
-     * @param int    $current_depth    Current depth of nested imports.
+     * @param string $css_content      The CSS content.
+     * @param string $css_url          The URL of the CSS file.
+     * @param array  &$processed_urls  An array of already processed URLs to avoid recursion.
+     * @param bool   $force_refresh    Whether to force refresh cached files.
+     * @param int    $current_depth     Current depth of nested imports.
      *
      * @return string The updated CSS content.
      */
@@ -747,11 +1035,11 @@ class SelfHostAssets {
     /**
      * Processes @import statements in CSS content.
      *
-     * @param string $css_content      The CSS content.
-     * @param string $css_url          The URL of the CSS file.
-     * @param array  &$processed_urls  An array of already processed URLs to avoid recursion.
-     * @param bool   $force_refresh    Whether to force refresh cached files.
-     * @param int    $current_depth     Current depth of nested imports.
+     * @param string $css_content       The CSS content.
+     * @param string $css_url           The URL of the CSS file.
+     * @param array  &$processed_urls   An array of already processed URLs to avoid recursion.
+     * @param bool   $force_refresh     Whether to force refresh cached files.
+     * @param int    $current_depth      Current depth of nested imports.
      *
      * @return string The updated CSS content.
      */
@@ -766,18 +1054,27 @@ class SelfHostAssets {
 
                 $absolute_import_url = $this->make_absolute_url($import_url, $css_url);
 
-                // Queue the imported CSS for background processing
+                // Queue the imported CSS for background processing with incremented current_depth
                 $this->background_process->push_to_queue([
                     'type'          => 'css',
                     'url'           => $absolute_import_url,
                     'force_refresh' => $force_refresh,
+                    'current_depth' => $current_depth + 1,
+                    'retry_count'   => 0, // Initialize retry count
+                    'max_retries'   => self::MAX_RETRIES,
                 ]);
+            }
 
-                // Dispatch the queue immediately to handle imports promptly
-                $this->background_process->save()->dispatch();
+            // Dispatch the queue once after processing all imports
+            $this->background_process->save()->dispatch();
 
-                // Retrieve the local URL from the mapping
-                $local_import_url = $this->get_local_url($absolute_import_url, 'css');
+            // Retrieve the local URLs from the mapping
+            foreach ($matches as $match) {
+                $import_url  = $match[2];
+                $media_query = isset($match[3]) ? $match[3] : '';
+
+                $absolute_import_url = $this->make_absolute_url($import_url, $css_url);
+                $local_import_url    = $this->get_local_url($absolute_import_url, 'css');
 
                 if ($local_import_url) {
                     // Reconstruct the @import statement with the local URL and original media queries
@@ -813,7 +1110,7 @@ class SelfHostAssets {
             return $css_content;
         }
 
-        $upload_dir   = wp_upload_dir();
+        $upload_dir   = $this->get_upload_dir();
         $font_dir     = trailingslashit($upload_dir['basedir']) . 'self-hosted-fonts/';
         $font_url_dir = trailingslashit($upload_dir['baseurl']) . 'self-hosted-fonts/';
 
@@ -823,7 +1120,7 @@ class SelfHostAssets {
         // Download each font and replace URLs in CSS content
         foreach ($font_urls as $font_url) {
             $absolute_font_url = $this->make_absolute_url($font_url, $css_url);
-            $local_font_url    = $this->download_font_file($absolute_font_url, $font_dir, $font_url_dir, $cache_expiration_days, $force_refresh);
+            $local_font_url    = $this->download_font_file($absolute_font_url, 'font', $force_refresh);
             if ($local_font_url) {
                 $css_content = str_replace($font_url, $local_font_url, $css_content);
             }
@@ -835,117 +1132,15 @@ class SelfHostAssets {
     /**
      * Download and save a font file locally.
      *
-     * @param string $url               The URL of the font file.
-     * @param string $font_dir          The directory to save font files.
-     * @param string $font_url_dir      The base URL directory for font files.
-     * @param int    $cache_expiration_days Cache expiration time in days.
-     * @param bool   $force_refresh     Whether to force refresh cached files.
+     * @param string $url                   The URL of the font file.
+     * @param string $type                  The type of the asset ('font').
+     * @param bool   $force_refresh         Whether to force refresh cached files.
      *
      * @return string|false The local URL of the cached font file or false on failure.
      */
-    private function download_font_file($url, $font_dir, $font_url_dir, $cache_expiration_days, $force_refresh) {
-        global $wpdb, $wp_filesystem;
-
-        if (!$this->initialize_filesystem()) {
-            return false;
-        }
-
-        if (!wp_http_validate_url($url)) {
-            $this->log_error(sprintf(__('Invalid font URL: %s', 'self-host-assets'), esc_url_raw($url)));
-            return false;
-        }
-
-        $extension = pathinfo($url, PATHINFO_EXTENSION);
-        if (empty($extension)) {
-            $this->log_error(sprintf(__('Cannot determine file extension for font URL: %s', 'self-host-assets'), esc_url_raw($url)));
-            return false;
-        }
-
-        $filename  = md5($url) . '.' . $extension;
-        $file_path = $font_dir . $filename;
-        $file_url  = $font_url_dir . $filename;
-
-        // Check if the file exists and if it's still fresh
-        if ($this->is_file_fresh($file_path, $cache_expiration_days) && !$force_refresh) {
-            $file_url = add_query_arg('ver', filemtime($file_path), $file_url);
-            return $file_url;
-        }
-
-        // Download the font file
-        $response = wp_remote_get($url, [
-            'timeout'     => 30,
-            'redirection' => 10,
-            'user-agent'  => 'WordPress/' . get_bloginfo('version') . '; ' . get_bloginfo('url'),
-        ]);
-
-        if (is_wp_error($response)) {
-            $error_message = $response->get_error_message();
-            $this->log_error(sprintf(__('Failed to download font file: %s - %s', 'self-host-assets'), esc_url_raw($url), $error_message));
-            return false;
-        }
-
-        $response_code = wp_remote_retrieve_response_code($response);
-        if ($response_code >= 400) {
-            $this->log_error(sprintf(__('HTTP Error %d while downloading font file: %s', 'self-host-assets'), $response_code, esc_url_raw($url)));
-            return false;
-        }
-
-        $file_content = wp_remote_retrieve_body($response);
-
-        if (empty($file_content)) {
-            $this->log_error(sprintf(__('Empty font file content: %s', 'self-host-assets'), esc_url_raw($url)));
-            return false;
-        }
-
-        // Save the file
-        if (!$wp_filesystem->is_dir($font_dir)) {
-            if (!$wp_filesystem->mkdir($font_dir, FS_CHMOD_DIR)) {
-                $this->log_error(sprintf(__('Failed to create directory: %s', 'self-host-assets'), esc_html($font_dir)));
-                return false;
-            }
-            // Create a marker file to indicate ownership
-            $wp_filesystem->put_contents($font_dir . '.self-host-assets', 'Plugin marker file', FS_CHMOD_FILE);
-        }
-
-        $saved = $wp_filesystem->put_contents($file_path, $file_content, FS_CHMOD_FILE);
-
-        if (!$saved) {
-            $this->log_error(sprintf(__('Failed to save font file: %s. Please check file permissions.', 'self-host-assets'), esc_html($file_path)));
-            return false;
-        }
-
-        // MIME type verification using wp_check_filetype_and_ext
-        $filetype_info = wp_check_filetype_and_ext($file_path, $filename);
-        $allowed_types = $this->get_allowed_mime_types('font');
-
-        if (!in_array($filetype_info['type'], $allowed_types, true)) {
-            $this->log_error(sprintf(__('Invalid file type for font: %s', 'self-host-assets'), esc_html($file_path)));
-            // Remove the invalid file
-            $wp_filesystem->delete($file_path);
-            return false;
-        }
-
-        // Set strict file permissions
-        $wp_filesystem->chmod($file_path, 0644);
-
-        // Insert mapping into the database
-        $wpdb->insert(
-            $this->mapping_table,
-            [
-                'original_url'    => $url,
-                'hashed_filename' => $filename,
-                'type'            => 'font',
-            ],
-            [
-                '%s',
-                '%s',
-                '%s',
-            ]
-        );
-
-        $file_url = add_query_arg('ver', filemtime($file_path), $file_url);
-
-        return $file_url;
+    public function download_font_file($url, $type, $force_refresh) {
+        // Reuse the download_file method with appropriate type and extension handling
+        return $this->download_file($url, $type, self::DEFAULT_CACHE_EXPIRATION_FONTS, $force_refresh);
     }
 
     /**
@@ -987,7 +1182,7 @@ class SelfHostAssets {
         }
 
         // Parse base URL
-        $parsed_base = parse_url($base_url);
+        $parsed_base = wp_parse_url($base_url);
         if (!isset($parsed_base['scheme']) || !isset($parsed_base['host'])) {
             // Invalid base URL
             return $relative_url;
@@ -1048,6 +1243,8 @@ class SelfHostAssets {
 
     /**
      * Add settings pages for the plugin.
+     *
+     * @return void
      */
     public function add_settings_pages() {
         // Main settings page
@@ -1082,6 +1279,8 @@ class SelfHostAssets {
 
     /**
      * Render the main settings page.
+     *
+     * @return void
      */
     public function render_settings_page() {
         ?>
@@ -1098,19 +1297,31 @@ class SelfHostAssets {
                 <?php wp_nonce_field('force_refresh_nonce', 'force_refresh_nonce_field'); ?>
                 <input type="hidden" name="action" value="force_refresh">
                 <?php
-                submit_button(__('Force Refresh Cache', 'self-host-assets'), 'secondary', 'force_refresh');
+                submit_button(__('Force Refresh Cache', 'self-host-assets'), 'secondary', 'force_refresh', false);
                 ?>
             </form>
             <?php settings_errors('self_host_assets_messages'); ?>
             <div class="notice notice-warning">
                 <p><?php esc_html_e('Please ensure you have the rights to self-host third-party resources and be aware of the security implications. Regularly update cached files to include any security patches or updates.', 'self-host-assets'); ?></p>
             </div>
+            <?php
+            // Display background processing status
+            if (!$this->background_complete) {
+                ?>
+                <div class="notice notice-info is-dismissible">
+                    <p><?php esc_html_e('Background processing of assets is currently in progress. Please check the "Manage Assets" page for updates.', 'self-host-assets'); ?></p>
+                </div>
+                <?php
+            }
+            ?>
         </div>
         <?php
     }
 
     /**
      * Render the Manage Assets page.
+     *
+     * @return void
      */
     public function render_manage_assets_page() {
         global $wpdb;
@@ -1124,7 +1335,7 @@ class SelfHostAssets {
                 $asset_type = sanitize_text_field($_POST['asset_type']);
                 $asset_url  = esc_url_raw($_POST['asset_url']);
 
-                // Retrieve the hashed filename from the mapping table
+                // Retrieve the hashed filename from the mapping table using prepared statements
                 $hashed_filename = $wpdb->get_var(
                     $wpdb->prepare(
                         "SELECT hashed_filename FROM {$this->mapping_table} WHERE original_url = %s AND type = %s LIMIT 1",
@@ -1135,29 +1346,26 @@ class SelfHostAssets {
 
                 if ($hashed_filename) {
                     $file_path = $this->get_local_file_path($asset_url, $asset_type);
-                    if (file_exists($file_path)) {
-                        if ($this->initialize_filesystem()) {
-                            global $wp_filesystem;
-                            if ($wp_filesystem->delete($file_path)) {
-                                // Delete the mapping entry
-                                $wpdb->delete(
-                                    $this->mapping_table,
-                                    [
-                                        'original_url'    => $asset_url,
-                                        'hashed_filename' => $hashed_filename,
-                                        'type'            => $asset_type,
-                                    ],
-                                    [
-                                        '%s',
-                                        '%s',
-                                        '%s',
-                                    ]
-                                );
+                    if ($this->initialize_filesystem() && $GLOBALS['wp_filesystem']->exists($file_path)) {
+                        if ($GLOBALS['wp_filesystem']->delete($file_path)) {
+                            // Delete the mapping entry
+                            $wpdb->delete(
+                                $this->mapping_table,
+                                [
+                                    'original_url'    => $asset_url,
+                                    'hashed_filename' => $hashed_filename,
+                                    'type'            => $asset_type,
+                                ],
+                                [
+                                    '%s',
+                                    '%s',
+                                    '%s',
+                                ]
+                            );
 
-                                $this->log_error(sprintf(__('Successfully deleted %s asset: %s', 'self-host-assets'), strtoupper($asset_type), esc_url_raw($asset_url)));
-                            } else {
-                                $this->log_error(sprintf(__('Failed to delete %s asset: %s', 'self-host-assets'), strtoupper($asset_type), esc_url_raw($asset_url)));
-                            }
+                            $this->log_error(sprintf(__('Successfully deleted %s asset: %s', 'self-host-assets'), strtoupper($asset_type), esc_url_raw($asset_url)), 'notice');
+                        } else {
+                            $this->log_error(sprintf(__('Failed to delete %s asset: %s', 'self-host-assets'), strtoupper($asset_type), esc_url_raw($asset_url)));
                         }
                     } else {
                         $this->log_error(sprintf(__('Asset file not found: %s', 'self-host-assets'), esc_url_raw($file_path)));
@@ -1184,6 +1392,7 @@ class SelfHostAssets {
                             <th><?php esc_html_e('Original URL', 'self-host-assets'); ?></th>
                             <th><?php esc_html_e('Local Path', 'self-host-assets'); ?></th>
                             <th><?php esc_html_e('Last Updated', 'self-host-assets'); ?></th>
+                            <th><?php esc_html_e('Status', 'self-host-assets'); ?></th>
                             <th><?php esc_html_e('Actions', 'self-host-assets'); ?></th>
                         </tr>
                     </thead>
@@ -1194,6 +1403,7 @@ class SelfHostAssets {
                                 <td><a href="<?php echo esc_url($asset->original_url); ?>" target="_blank"><?php echo esc_html($asset->original_url); ?></a></td>
                                 <td><a href="<?php echo esc_url($asset->local_url); ?>" target="_blank"><?php echo esc_html($asset->local_url); ?></a></td>
                                 <td><?php echo esc_html($asset->last_updated); ?></td>
+                                <td><?php echo esc_html($asset->status); ?></td>
                                 <td>
                                     <form method="post" action="">
                                         <?php wp_nonce_field('manage_assets_action', 'manage_assets_nonce'); ?>
@@ -1213,6 +1423,8 @@ class SelfHostAssets {
 
     /**
      * Render the Error Logs page.
+     *
+     * @return void
      */
     public function render_error_logs_page() {
         global $wpdb;
@@ -1225,14 +1437,14 @@ class SelfHostAssets {
             } else {
                 $deleted = $wpdb->query("TRUNCATE TABLE {$this->log_table}");
                 if ($deleted !== false) {
-                    $this->log_error(__('Successfully deleted all error logs.', 'self-host-assets'));
+                    $this->log_error(__('Successfully deleted all error logs.', 'self-host-assets'), 'notice');
                 } else {
                     $this->log_error(__('Failed to delete error logs.', 'self-host-assets'));
                 }
             }
         }
 
-        // Retrieve all logs
+        // Retrieve all logs using direct query
         $logs = $wpdb->get_results("SELECT * FROM {$this->log_table} ORDER BY timestamp DESC");
 
         ?>
@@ -1268,6 +1480,8 @@ class SelfHostAssets {
 
     /**
      * Handle the force refresh action.
+     *
+     * @return void
      */
     public function handle_force_refresh() {
         if (!current_user_can('manage_options')) {
@@ -1277,7 +1491,7 @@ class SelfHostAssets {
         check_admin_referer('force_refresh_nonce', 'force_refresh_nonce_field');
 
         update_option('force_refresh', 1);
-        add_settings_error('self_host_assets_messages', 'force_refresh', __('Cache will be refreshed on the next scheduled run.', 'self-host-assets'), 'updated');
+        add_settings_error('self_host_assets_messages', 'force_refresh', __('Cache refresh initiated successfully.', 'self-host-assets'), 'updated');
 
         wp_redirect(admin_url('options-general.php?page=self-host-assets'));
         exit;
@@ -1285,6 +1499,8 @@ class SelfHostAssets {
 
     /**
      * Register plugin settings.
+     *
+     * @return void
      */
     public function register_settings() {
         register_setting('self_host_assets_settings_group', 'self_host_css', [
@@ -1414,6 +1630,8 @@ class SelfHostAssets {
 
     /**
      * Render the CSS field.
+     *
+     * @return void
      */
     public function render_css_field() {
         $self_host_css = get_option('self_host_css', 1);
@@ -1425,6 +1643,8 @@ class SelfHostAssets {
 
     /**
      * Render the JavaScript field.
+     *
+     * @return void
      */
     public function render_js_field() {
         $self_host_js = get_option('self_host_js', 0);
@@ -1436,6 +1656,8 @@ class SelfHostAssets {
 
     /**
      * Render the CSS cache expiration field.
+     *
+     * @return void
      */
     public function render_cache_expiration_css_field() {
         $cache_expiration_days = intval(get_option('cache_expiration_days_css', self::DEFAULT_CACHE_EXPIRATION_CSS));
@@ -1447,6 +1669,8 @@ class SelfHostAssets {
 
     /**
      * Render the fonts cache expiration field.
+     *
+     * @return void
      */
     public function render_cache_expiration_fonts_field() {
         $cache_expiration_days = intval(get_option('cache_expiration_days_fonts', self::DEFAULT_CACHE_EXPIRATION_FONTS));
@@ -1458,6 +1682,8 @@ class SelfHostAssets {
 
     /**
      * Render the JavaScript cache expiration field.
+     *
+     * @return void
      */
     public function render_cache_expiration_js_field() {
         $cache_expiration_days = intval(get_option('cache_expiration_days_js', self::DEFAULT_CACHE_EXPIRATION_JS));
@@ -1469,6 +1695,8 @@ class SelfHostAssets {
 
     /**
      * Render the cron schedule field.
+     *
+     * @return void
      */
     public function render_cron_schedule_field() {
         $cron_schedule = get_option('cron_schedule', 'daily');
@@ -1486,8 +1714,10 @@ class SelfHostAssets {
     /**
      * Reschedule the cron event when the cron schedule option changes.
      *
-     * @param mixed $old_value   The old value of the option.
-     * @param mixed $new_value   The new value of the option.
+     * @param mixed $old_value The old value of the option.
+     * @param mixed $new_value The new value of the option.
+     *
+     * @return void
      */
     public function reschedule_cron_event($old_value, $new_value) {
         if ($old_value !== $new_value) {
@@ -1500,49 +1730,9 @@ class SelfHostAssets {
     }
 
     /**
-     * Log errors and store them in the database.
-     *
-     * @param string $message The error message.
-     */
-    private function log_error($message) {
-        if (count($this->errors) < 5) { // Limit stored errors to prevent memory issues
-            $this->errors[] = $message;
-        }
-
-        // Insert log into the database
-        global $wpdb;
-        $wpdb->insert(
-            $this->log_table,
-            [
-                'timestamp' => current_time('mysql'),
-                'message'   => $message,
-            ],
-            [
-                '%s',
-                '%s',
-            ]
-        );
-
-        // Additionally, log to PHP error log
-        error_log('SelfHostAssets Plugin Error: ' . $message);
-    }
-
-    /**
-     * Display admin notices for errors.
-     */
-    public function display_admin_notices() {
-        if (!current_user_can('manage_options') || empty($this->errors)) {
-            return;
-        }
-        foreach ($this->errors as $error) {
-            echo '<div class="notice notice-error"><p>' . esc_html($error) . '</p></div>';
-        }
-        // Reset errors after displaying
-        $this->errors = [];
-    }
-
-    /**
      * Cleanup cached files and delete plugin options when the plugin is uninstalled.
+     *
+     * @return void
      */
     public static function uninstall() {
         if (!defined('WP_UNINSTALL_PLUGIN')) {
@@ -1552,7 +1742,7 @@ class SelfHostAssets {
         global $wpdb, $wp_filesystem;
 
         require_once ABSPATH . 'wp-admin/includes/file.php';
-        if (!\WP_Filesystem()) {
+        if (!WP_Filesystem()) {
             return;
         }
 
@@ -1562,6 +1752,7 @@ class SelfHostAssets {
             trailingslashit($upload_dir['basedir']) . 'self-hosted-css/',
             trailingslashit($upload_dir['basedir']) . 'self-hosted-fonts/',
             trailingslashit($upload_dir['basedir']) . 'self-hosted-js/',
+            // trailingslashit($upload_dir['basedir']) . 'self-hosted-images/', // Uncomment if image handling is implemented
         ];
 
         foreach ($directories as $dir) {
@@ -1582,11 +1773,14 @@ class SelfHostAssets {
             'cache_expiration_days_js',
             'force_refresh',
             'cron_schedule',
-            'self_host_assets_errors',
+            // 'self_host_assets_errors', // Removed as it's unused
         ];
 
         foreach ($options as $option) {
             delete_option($option);
+            if (is_multisite()) {
+                delete_site_option($option);
+            }
         }
 
         // Delete logs table
@@ -1597,271 +1791,406 @@ class SelfHostAssets {
     }
 
     /**
-     * Get all cached assets from the filesystem.
+     * Retrieve all cached assets from the mapping table.
      *
-     * @return array An array of asset objects.
+     * @return array An array of cached assets with details.
      */
     private function get_all_cached_assets() {
-        $assets = [];
-        $types  = ['css', 'js', 'font'];
         global $wpdb;
 
-        foreach ($types as $type) {
-            $upload_dir = wp_upload_dir();
-            $sub_dir    = 'self-hosted-' . $type . '/';
-            $dir        = trailingslashit($upload_dir['basedir']) . $sub_dir;
-            $url_dir    = trailingslashit($upload_dir['baseurl']) . $sub_dir;
+        // Initialize Filesystem once to avoid redundant calls
+        if (!$this->initialize_filesystem()) {
+            return [];
+        }
 
-            if (is_dir($dir)) {
-                $files = scandir($dir);
-                foreach ($files as $file) {
-                    if ($file === '.' || $file === '..' || $file === '.self-host-assets') {
-                        continue;
-                    }
+        $assets = $wpdb->get_results("SELECT * FROM {$this->mapping_table} ORDER BY type ASC, original_url ASC");
 
-                    $file_path = trailingslashit($dir) . $file;
-                    if (is_file($file_path)) {
-                        // Retrieve original URL from mapping table
-                        $original_url = $wpdb->get_var(
-                            $wpdb->prepare(
-                                "SELECT original_url FROM {$this->mapping_table} WHERE hashed_filename = %s AND type = %s LIMIT 1",
-                                $file,
-                                $type
-                            )
-                        );
+        if (empty($assets)) {
+            return [];
+        }
 
-                        $local_url    = add_query_arg('ver', filemtime($file_path), trailingslashit($url_dir) . $file);
-                        $last_updated = date_i18n(get_option('date_format') . ' ' . get_option('time_format'), filemtime($file_path));
+        $processed_assets = [];
 
-                        $assets[] = (object) [
-                            'type'         => $type,
-                            'original_url' => $original_url ? $original_url : __('Unknown', 'self-host-assets'),
-                            'local_url'    => $local_url,
-                            'last_updated' => $last_updated,
-                        ];
-                    }
+        foreach ($assets as &$asset) {
+            $sub_dir = 'self-hosted-' . $asset->type . '/';
+            $file_path = trailingslashit($this->upload_dir['basedir']) . $sub_dir . $asset->hashed_filename;
+            $file_url = trailingslashit($this->upload_dir['baseurl']) . $sub_dir . $asset->hashed_filename;
+
+            if ($GLOBALS['wp_filesystem']->exists($file_path)) {
+                $file_mod_time = method_exists($GLOBALS['wp_filesystem'], 'mtime') ? 
+                                 $GLOBALS['wp_filesystem']->mtime($file_path) : 
+                                 filemtime($file_path);
+
+                if ($file_mod_time !== false) {
+                    $local_url = add_query_arg('ver', $file_mod_time, esc_url($file_url));
+                    $last_updated = date_i18n(get_option('date_format') . ' ' . get_option('time_format'), $file_mod_time);
+                } else {
+                    $local_url = '';
+                    $last_updated = __('Unknown', 'self-host-assets');
+                }
+
+                // Determine the status based on recent processing
+                $status = $this->determine_asset_status($asset->original_url, $asset->type);
+
+                $processed_assets[] = (object) [
+                    'type'         => $asset->type,
+                    'original_url' => $asset->original_url,
+                    'local_url'    => $local_url,
+                    'last_updated' => $last_updated,
+                    'status'       => $status,
+                ];
+            } else {
+                $processed_assets[] = (object) [
+                    'type'         => $asset->type,
+                    'original_url' => $asset->original_url,
+                    'local_url'    => '',
+                    'last_updated' => __('File not found', 'self-host-assets'),
+                    'status'       => __('Missing', 'self-host-assets'),
+                ];
+            }
+        }
+
+        return $processed_assets;
+    }
+
+    /**
+     * Determine the processing status of an asset.
+     *
+     * @param string $url  The original URL of the asset.
+     * @param string $type The type of the asset.
+     *
+     * @return string The status of the asset.
+     */
+    private function determine_asset_status($url, $type) {
+        global $wpdb;
+
+        // Check if the asset is currently queued or in processing
+        $queue = get_transient($this->background_process->identifier);
+        if (is_array($queue)) {
+            foreach ($queue as $task) {
+                if ($task['url'] === $url && $task['type'] === $type) {
+                    return __('Queued', 'self-host-assets');
                 }
             }
         }
 
-        return $assets;
+        // Check if there are any recent errors related to this asset
+        $recent_errors = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$this->log_table} WHERE original_url = %s AND message LIKE %s",
+                $url,
+                '%' . $wpdb->esc_like('Failed to download') . '%'
+            )
+        );
+
+        if ($recent_errors > 0) {
+            return __('Failed', 'self-host-assets');
+        }
+
+        return __('Completed', 'self-host-assets');
     }
 
     /**
-     * Get allowed MIME types for different file types.
+     * Callback method when background processing is complete.
      *
-     * @param string $type The type of the asset ('css', 'js', 'font').
+     * @return void
+     */
+    public function on_background_process_complete() {
+        $this->background_complete = true;
+        // Optionally, add an admin notice or perform other actions
+    }
+
+    /**
+     * Cleanup cached files and delete plugin options when the plugin is uninstalled.
+     *
+     * @return void
+     */
+    public static function uninstall() {
+        if (!defined('WP_UNINSTALL_PLUGIN')) {
+            exit();
+        }
+
+        global $wpdb, $wp_filesystem;
+
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        if (!WP_Filesystem()) {
+            return;
+        }
+
+        $upload_dir = wp_upload_dir();
+
+        $directories = [
+            trailingslashit($upload_dir['basedir']) . 'self-hosted-css/',
+            trailingslashit($upload_dir['basedir']) . 'self-hosted-fonts/',
+            trailingslashit($upload_dir['basedir']) . 'self-hosted-js/',
+            // trailingslashit($upload_dir['basedir']) . 'self-hosted-images/', // Uncomment if image handling is implemented
+        ];
+
+        foreach ($directories as $dir) {
+            if ($wp_filesystem->is_dir($dir)) {
+                // Check for marker file before deletion
+                if ($wp_filesystem->exists($dir . '.self-host-assets')) {
+                    $wp_filesystem->delete($dir, true);
+                }
+            }
+        }
+
+        // Delete related options
+        $options = [
+            'self_host_css',
+            'self_host_js',
+            'cache_expiration_days_css',
+            'cache_expiration_days_fonts',
+            'cache_expiration_days_js',
+            'force_refresh',
+            'cron_schedule',
+            // 'self_host_assets_errors', // Removed as it's unused
+        ];
+
+        foreach ($options as $option) {
+            delete_option($option);
+            if (is_multisite()) {
+                delete_site_option($option);
+            }
+        }
+
+        // Delete logs table
+        $wpdb->query("DROP TABLE IF EXISTS {$wpdb->prefix}self_host_assets_logs");
+
+        // Delete mapping table
+        $wpdb->query("DROP TABLE IF EXISTS {$wpdb->prefix}self_host_assets_mapping");
+    }
+
+    /**
+     * Retrieve all cached assets from the mapping table.
+     *
+     * @return array An array of cached assets with details.
+     */
+    private function get_all_cached_assets() {
+        global $wpdb;
+
+        // Initialize Filesystem once to avoid redundant calls
+        if (!$this->initialize_filesystem()) {
+            return [];
+        }
+
+        // Ensure upload_dir is set
+        if (is_null($this->upload_dir)) {
+            $this->upload_dir = $this->get_upload_dir();
+        }
+
+        $assets = $wpdb->get_results("SELECT * FROM {$this->mapping_table} ORDER BY type ASC, original_url ASC");
+
+        if (empty($assets)) {
+            return [];
+        }
+
+        $processed_assets = [];
+
+        foreach ($assets as &$asset) {
+            $sub_dir = 'self-hosted-' . $asset->type . '/';
+            $file_path = trailingslashit($this->upload_dir['basedir']) . $sub_dir . $asset->hashed_filename;
+            $file_url = trailingslashit($this->upload_dir['baseurl']) . $sub_dir . $asset->hashed_filename;
+
+            if ($GLOBALS['wp_filesystem']->exists($file_path)) {
+                $file_mod_time = method_exists($GLOBALS['wp_filesystem'], 'mtime') ? 
+                                 $GLOBALS['wp_filesystem']->mtime($file_path) : 
+                                 filemtime($file_path);
+
+                if ($file_mod_time !== false) {
+                    $local_url = add_query_arg('ver', $file_mod_time, esc_url($file_url));
+                    $last_updated = date_i18n(get_option('date_format') . ' ' . get_option('time_format'), $file_mod_time);
+                } else {
+                    $local_url = '';
+                    $last_updated = __('Unknown', 'self-host-assets');
+                }
+
+                // Determine the status based on recent processing
+                $status = $this->determine_asset_status($asset->original_url, $asset->type);
+
+                $processed_assets[] = (object) [
+                    'type'         => $asset->type,
+                    'original_url' => $asset->original_url,
+                    'local_url'    => $local_url,
+                    'last_updated' => $last_updated,
+                    'status'       => $status,
+                ];
+            } else {
+                $processed_assets[] = (object) [
+                    'type'         => $asset->type,
+                    'original_url' => $asset->original_url,
+                    'local_url'    => '',
+                    'last_updated' => __('File not found', 'self-host-assets'),
+                    'status'       => __('Missing', 'self-host-assets'),
+                ];
+            }
+        }
+
+        return $processed_assets;
+    }
+
+    /**
+     * Determine the processing status of an asset.
+     *
+     * @param string $url  The original URL of the asset.
+     * @param string $type The type of the asset.
+     *
+     * @return string The status of the asset.
+     */
+    private function determine_asset_status($url, $type) {
+        global $wpdb;
+
+        // Check if the asset is currently queued or in processing
+        $queue = get_transient($this->background_process->identifier);
+        if (is_array($queue)) {
+            foreach ($queue as $task) {
+                if ($task['url'] === $url && $task['type'] === $type) {
+                    return __('Queued', 'self-host-assets');
+                }
+            }
+        }
+
+        // Check if there are any recent errors related to this asset
+        $recent_errors = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$this->log_table} WHERE original_url = %s AND message LIKE %s",
+                $url,
+                '%' . $wpdb->esc_like('Failed to download') . '%'
+            )
+        );
+
+        if ($recent_errors > 0) {
+            return __('Failed', 'self-host-assets');
+        }
+
+        return __('Completed', 'self-host-assets');
+    }
+
+    /**
+     * Log errors and store them in the database.
+     *
+     * @param string $message The error message.
+     * @param string $level   The severity level ('notice', 'warning', 'error').
+     *
+     * @return void
+     */
+    private function log_error($message, $level = 'error') {
+        // Remove the limit to store all errors
+        $this->errors[] = sprintf('[%s] %s', strtoupper($level), $message);
+
+        // Include context using debug_backtrace
+        $backtrace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2);
+        $caller = isset($backtrace[1]['function']) ? $backtrace[1]['function'] : 'global';
+
+        $full_message = sprintf('[%s] %s: %s', strtoupper($level), $caller, $message);
+
+        // Insert log into the database using prepared statements
+        global $wpdb;
+        $wpdb->insert(
+            $this->log_table,
+            [
+                'timestamp' => current_time('mysql'),
+                'message'   => $full_message,
+            ],
+            [
+                '%s',
+                '%s',
+            ]
+        );
+
+        // Additionally, log to PHP error log
+        error_log('SelfHostAssets Plugin Error: ' . $full_message);
+    }
+
+    /**
+     * Display admin notices for errors.
+     *
+     * @return void
+     */
+    public function display_admin_notices() {
+        if (!current_user_can('manage_options') || empty($this->errors)) {
+            return;
+        }
+        foreach ($this->errors as $error) {
+            echo '<div class="notice notice-' . esc_attr($this->get_notice_class($error)) . '"><p>' . esc_html($error) . '</p></div>';
+        }
+        // Reset errors after displaying
+        $this->errors = [];
+    }
+
+    /**
+     * Determine the notice class based on the error message.
+     *
+     * @param string $error The error message.
+     *
+     * @return string The CSS class for the notice.
+     */
+    private function get_notice_class($error) {
+        if (strpos($error, '[ERROR]') !== false) {
+            return 'error';
+        } elseif (strpos($error, '[WARNING]') !== false) {
+            return 'warning';
+        } elseif (strpos($error, '[NOTICE]') !== false) {
+            return 'updated'; // 'updated' class for success notices
+        } else {
+            return 'info';
+        }
+    }
+
+    /**
+     * Get the upload directory information.
+     *
+     * @return array The upload directory information.
+     */
+    private function get_upload_dir() {
+        return wp_upload_dir();
+    }
+
+    /**
+     * Get allowed MIME types based on the asset type.
+     *
+     * @param string $type The type of the asset ('css', 'js', 'font', 'image').
      *
      * @return array An array of allowed MIME types.
      */
     private function get_allowed_mime_types($type) {
+        $allowed = [];
         switch ($type) {
             case 'css':
-                return ['text/css'];
+                $allowed = ['text/css'];
+                break;
             case 'js':
-                return [
-                    'application/javascript',
-                    'text/javascript',
-                    'application/x-javascript',
-                    'application/ecmascript',
-                    'text/ecmascript',
-                ];
+                $allowed = ['application/javascript', 'application/x-javascript'];
+                break;
             case 'font':
-                return [
+                $allowed = [
                     'font/woff',
                     'font/woff2',
                     'application/font-woff',
                     'application/font-woff2',
-                    'application/font-ttf',
-                    'application/font-sfnt',
-                    'application/vnd.ms-fontobject',
-                    'font/otf',
+                    'application/octet-stream', // eot
+                    'application/x-font-ttf',    // ttf
                     'font/ttf',
-                    'image/svg+xml', // For SVG fonts
+                    'font/otf',
+                    'application/font-sfnt',    // svg
                 ];
+                break;
+            case 'image':
+                $allowed = ['image/png', 'image/jpeg', 'image/gif', 'image/svg+xml'];
+                break;
             default:
-                return [];
+                $allowed = [];
         }
+        return $allowed;
     }
 }
 
 /**
- * Asset_Process Class
- *
- * Handles background processing of assets.
+ * Plugin Initialization
  */
-class Asset_Process extends WP_Background_Process {
-
-    /**
-     * Action name for the background process.
-     *
-     * @var string
-     */
-    protected $action = 'self_host_assets_background_process';
-
-    /**
-     * Main plugin instance.
-     *
-     * @var SelfHostAssets
-     */
-    protected $main_plugin;
-
-    /**
-     * Set the main plugin instance.
-     *
-     * @param SelfHostAssets $plugin The main plugin instance.
-     */
-    public function set_main_plugin($plugin) {
-        $this->main_plugin = $plugin;
-    }
-
-    /**
-     * Task to handle each queued item.
-     *
-     * @param array $item The queued item.
-     *
-     * @return bool False if the task should be removed from the queue, true otherwise.
-     */
-    protected function task($item) {
-        if (!isset($item['type']) || !isset($item['url'])) {
-            // Invalid task
-            return false;
-        }
-
-        $type = sanitize_text_field($item['type']);
-        $url = esc_url_raw($item['url']);
-        $force_refresh = isset($item['force_refresh']) ? boolval($item['force_refresh']) : false;
-
-        switch ($type) {
-            case 'css':
-                $this->main_plugin->download_and_replace_css($url, $force_refresh);
-                break;
-            case 'js':
-                $this->main_plugin->download_and_replace_js($url, $force_refresh);
-                break;
-            default:
-                // Unsupported type
-                $this->main_plugin->log_error(sprintf(__('Unsupported asset type: %s', 'self-host-assets'), esc_html($type)));
-                return false;
-        }
-
-        // Return false to remove the task from the queue
-        return false;
-    }
-
-    /**
-     * Complete the background process.
-     */
-    protected function complete() {
-        parent::complete();
-    }
-}
-
-/**
- * WP_Background_Process Class
- *
- * A base class for handling background processing.
- */
-abstract class WP_Background_Process {
-
-    /**
-     * Action name for the background process.
-     *
-     * @var string
-     */
-    protected $action = '';
-
-    /**
-     * Identifier for the background process.
-     *
-     * @var string
-     */
-    protected $identifier = '';
-
-    /**
-     * Data queue.
-     *
-     * @var array
-     */
-    protected $queue = [];
-
-    /**
-     * Constructor.
-     */
-    public function __construct() {
-        if (empty($this->action)) {
-            throw new \Exception(__('You must set the action for the background process.', 'self-host-assets'));
-        }
-
-        $this->identifier = 'wp_' . $this->action;
-
-        add_action($this->identifier, [$this, 'process_queue']);
-    }
-
-    /**
-     * Push data to the queue.
-     *
-     * @param mixed $data Data.
-     * @return $this
-     */
-    public function push_to_queue($data) {
-        $this->queue[] = $data;
-        return $this;
-    }
-
-    /**
-     * Save the queue to the database.
-     *
-     * @return $this
-     */
-    public function save() {
-        update_option($this->identifier, $this->queue);
-        $this->queue = [];
-        return $this;
-    }
-
-    /**
-     * Dispatch the queue.
-     */
-    public function dispatch() {
-        if (!wp_next_scheduled($this->identifier)) {
-            wp_schedule_single_event(time(), $this->identifier, []);
-        }
-    }
-
-    /**
-     * Process the queue.
-     */
-    public function process_queue() {
-        $this->queue = get_option($this->identifier, []);
-
-        foreach ($this->queue as $item) {
-            $this->task($item);
-        }
-
-        delete_option($this->identifier);
-
-        $this->complete();
-    }
-
-    /**
-     * Task to handle each queued item.
-     *
-     * @param mixed $item The queued item.
-     * @return mixed
-     */
-    abstract protected function task($item);
-
-    /**
-     * Complete the background process.
-     */
-    protected function complete() {
-        // This method can be overridden to perform actions when the queue is complete.
-    }
-}
 
 // Initialize the plugin
 SelfHostAssets::get_instance();
 
-// Register uninstall hook
-register_uninstall_hook(__FILE__, [SelfHostAssets::class, 'uninstall']);
+// Register uninstall hook with fully qualified class name
+register_uninstall_hook(__FILE__, ['SelfHostAssetsPlugin\SelfHostAssets', 'uninstall']);
